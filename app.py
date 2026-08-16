@@ -11,7 +11,8 @@ This script reports only; it does not submit anything or write an output file.
 import argparse
 import csv
 import json
-from collections import Counter, defaultdict
+import tomllib
+from collections import Counter, defaultdict, namedtuple
 from datetime import datetime
 
 # Default input locations, relative to the working directory. All are
@@ -19,10 +20,22 @@ from datetime import datetime
 DEFAULT_SCORES = "scores.json"
 DEFAULT_MEMBERS = "Members.csv"
 DEFAULT_AGE_GROUPS = "age-groups.json"
-DEFAULT_MAPPINGS = "mappings.json"
+DEFAULT_ROUNDS = "rounds.json"
+DEFAULT_BOWTYPES = "bowtypes.json"
+DEFAULT_MAPPINGS = "mappings.toml"
 
 # Numeric score fields that must be present and integer-parseable.
 NUMERIC_FIELDS = ("score", "hits", "golds")
+
+# All the reference lookups needed to map one score, resolved once at startup.
+#   name_map:  ExpertArcher name -> Golden Records name (from mappings.json).
+#              A single generic map; the field being resolved (round vs bow
+#              type) decides which id table the result is looked up in.
+#   *_ids:     Golden Records name -> Golden Records id (from the official files)
+Lookups = namedtuple(
+    "Lookups",
+    "members age_groups name_map round_ids class_ids",
+)
 
 
 def load_json(path):
@@ -42,10 +55,31 @@ def load_members(path):
         return {row["name"]: row["member_id"] for row in csv.DictReader(file)}
 
 
+def load_rounds(path):
+    """Return a mapping of Golden Records round name -> round_id.
+
+    Keyed by lower-cased name so lookups are case-insensitive (see `resolve`).
+    """
+    return {row["round"].lower(): row["round_id"] for row in load_json(path)}
+
+
+def load_bowtypes(path):
+    """Return a mapping of Golden Records bow class name -> class_id.
+
+    Keyed by lower-cased name so lookups are case-insensitive (see `resolve`).
+    """
+    return {row["bow_class"].lower(): row["class_id"] for row in load_json(path)}
+
+
 def load_mappings(path):
-    """Return the (classes, rounds) reference maps from the mappings file."""
-    data = load_json(path)
-    return data["classes"], data["rounds"]
+    """Return the ExpertArcher name -> Golden Records name map (TOML).
+
+    A single flat map covering both rounds and bow types; the code resolves
+    each mapped name against the appropriate id table by context. TOML is used
+    so the file can carry comments grouping the entries by type.
+    """
+    with open(path, "rb") as file:  # tomllib requires a binary stream
+        return tomllib.load(file)
 
 
 def format_date(value):
@@ -74,26 +108,59 @@ def get_age_group(gender, age_class):
     return f"{prefix} {suffix}".strip()
 
 
-def transform_score(score, age_groups, members, classes, rounds):
+def resolve(ea_name, name_map, name_to_id, kind):
+    """Resolve an ExpertArcher name to a Golden Records id.
+
+    The name is first translated via the mappings; names not listed there are
+    used as-is (many match Golden Records exactly, so only the differences are
+    kept in the mappings file). The resulting name is then looked up in the
+    official id table, case-insensitively (the id tables are keyed by
+    lower-cased name), so names differing only by capitalisation need no
+    mapping.
+
+    Returns (id, None) on success, or (None, reason) where reason is a
+    (category, detail) tuple for the report:
+      - "unmatched <kind>": the name is unknown to both the mappings and
+        Golden Records, so a mapping needs adding.
+      - "unknown Golden Records <kind>": a mapping exists but points at a name
+        Golden Records does not recognise, so the mapping is wrong.
+    """
+    gr_name = name_map.get(ea_name, ea_name)
+    found = name_to_id.get(gr_name.lower()) if isinstance(gr_name, str) else None
+    if found is not None:
+        return found, None
+    if ea_name in name_map:  # explicitly mapped, but to a non-existent name
+        return None, (f"unknown Golden Records {kind}", f"{ea_name!r} -> {gr_name!r}")
+    return None, (f"unmatched {kind}", ea_name)
+
+
+def transform_score(score, lookups):
     """Map one ExpertArcher score onto a Golden Records API record.
+
+    Rounds and bow types are resolved via `resolve`: the ExpertArcher name is
+    translated to a Golden Records name via the mappings (or used as-is if not
+    listed), then that name is resolved to an id via the official reference
+    files.
 
     Returns (record, None) on success, or (None, reason) if the score cannot
     be mapped. `reason` is a (category, detail) tuple used by the report.
     """
     ea_round = score.get("round")
-    if ea_round not in rounds:
-        return None, ("unmatched round", ea_round)
+    round_id, reason = resolve(ea_round, lookups.name_map, lookups.round_ids, "round")
+    if reason is not None:
+        return None, reason
 
     ea_bowtype = score.get("bowtype")
-    if ea_bowtype not in classes:
-        return None, ("unmatched bow type", ea_bowtype)
+    class_id, reason = resolve(ea_bowtype, lookups.name_map, lookups.class_ids, "bow type")
+    if reason is not None:
+        return None, reason
 
     ea_name = score.get("name")
-    if ea_name not in members:
+    if ea_name not in lookups.members:
         return None, ("unmatched member name", ea_name)
 
     age_group_name = get_age_group(score.get("gender"), score.get("class"))
-    if age_group_name not in age_groups:
+    if age_group_name not in lookups.age_groups:
         detail = f"{score.get('gender')}/{score.get('class')} -> {age_group_name!r}"
         return None, ("unmatched age group", detail)
 
@@ -122,17 +189,17 @@ def transform_score(score, age_groups, members, classes, rounds):
     location = place.strip() if isinstance(place, str) else ""
 
     record = {
-        "age_group_id": age_groups[age_group_name],
-        "class_id": classes[ea_bowtype],
+        "age_group_id": lookups.age_groups[age_group_name],
+        "class_id": class_id,
         "date_shot": date_shot,
-        "member_id": members[ea_name],
+        "member_id": lookups.members[ea_name],
         "golds": numbers["golds"],
         "hits": numbers["hits"],
         "location": location,
         "qualifying": "252" not in ea_round,
         "record_qualifying": True,
         "record_status": ea_tournament,
-        "round_id": rounds[ea_round],
+        "round_id": round_id,
         "score": numbers["score"],
         "status": status,
         "Xs": xs,
@@ -140,7 +207,7 @@ def transform_score(score, age_groups, members, classes, rounds):
     return record, None
 
 
-def process(scores, age_groups, members, classes, rounds):
+def process(scores, lookups):
     """Transform every score, returning (records, skips).
 
     `skips` is a list of (category, detail, archer) tuples, one per skipped
@@ -149,7 +216,7 @@ def process(scores, age_groups, members, classes, rounds):
     records = []
     skips = []
     for score in scores:
-        record, reason = transform_score(score, age_groups, members, classes, rounds)
+        record, reason = transform_score(score, lookups)
         if reason is None:
             records.append(record)
         else:
@@ -227,20 +294,29 @@ def build_arg_parser():
                         help=f"Members CSV export (default: {DEFAULT_MEMBERS})")
     parser.add_argument("--age-groups", default=DEFAULT_AGE_GROUPS,
                         help=f"Age groups JSON (default: {DEFAULT_AGE_GROUPS})")
+    parser.add_argument("--rounds", default=DEFAULT_ROUNDS,
+                        help=f"Golden Records rounds JSON (default: {DEFAULT_ROUNDS})")
+    parser.add_argument("--bowtypes", default=DEFAULT_BOWTYPES,
+                        help=f"Golden Records bow types JSON (default: {DEFAULT_BOWTYPES})")
     parser.add_argument("--mappings", default=DEFAULT_MAPPINGS,
-                        help=f"Round/class mappings JSON (default: {DEFAULT_MAPPINGS})")
+                        help=f"ExpertArcher -> Golden Records name mappings TOML "
+                             f"(default: {DEFAULT_MAPPINGS})")
     return parser
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
 
-    age_groups = load_age_groups(args.age_groups)
-    members = load_members(args.members)
-    classes, rounds = load_mappings(args.mappings)
+    lookups = Lookups(
+        members=load_members(args.members),
+        age_groups=load_age_groups(args.age_groups),
+        name_map=load_mappings(args.mappings),
+        round_ids=load_rounds(args.rounds),
+        class_ids=load_bowtypes(args.bowtypes),
+    )
     scores = load_json(args.scores)
 
-    records, skips = process(scores, age_groups, members, classes, rounds)
+    records, skips = process(scores, lookups)
     print_report(len(scores), records, skips)
 
 
