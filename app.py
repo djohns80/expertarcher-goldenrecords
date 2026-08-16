@@ -5,6 +5,14 @@ the fields the Golden Records API expects, using reference data for rounds,
 bow classes, age groups and members. Records that cannot be mapped are skipped
 and explained in a summary report so they can be fixed at source.
 
+Pipeline (see main() at the bottom):
+  1. Fetch reference data from Golden Records (fetch_resource) into the
+     golden-records/ files, unless already present. These give us the ids.
+  2. Fetch the scores to process from ExpertArcher (fetch_scores).
+  3. Map each score to a Golden Records record (transform_score), resolving
+     round / bow-type / member / age-group names to ids (resolve).
+  4. Report what mapped and what was skipped, and why (print_report).
+
 Scores come from the ExpertArcher API (the [expertarcher] section of
 config.toml); the reporting window is set with --from / --to. The Golden
 Records reference files (rounds.json, bowtypes.json, age-groups.json,
@@ -13,6 +21,7 @@ using the [api] section. API keys are read from the environment, never a file
 (see the ENV_* constants). See build_arg_parser for all options.
 
 This script reports only; it does not submit anything or write an output file.
+README.md has the full integration overview, field mapping and setup.
 """
 
 import argparse
@@ -101,7 +110,7 @@ def load_mappings(path):
 
 
 def load_config(path):
-    """Load the Golden Records API config (TOML), or return {} if absent."""
+    """Load the API config (TOML) for both APIs, or return {} if absent."""
     if not os.path.exists(path):
         return {}
     with open(path, "rb") as file:
@@ -114,9 +123,9 @@ class RateLimiter:
     Golden Records throttles to 1 request/second (and 20/minute, 200/hour).
     Spacing requests at least `min_interval` apart satisfies the per-second
     limit; a single run makes only a handful of requests, so the minute/hour
-    limits are not a concern (the retry logic in `fetch_resource` handles them
-    if they ever are). One shared instance spaces requests across all
-    downloads in a run.
+    limits are not a concern (the retry logic in `_get_with_retry` handles them
+    if they ever are). One shared instance spaces every request in a run --
+    across both the Golden Records downloads and the ExpertArcher scores fetch.
     """
 
     def __init__(self, min_interval):
@@ -441,20 +450,24 @@ def transform_score(score, lookups):
     place = score.get("place")
     location = place.strip() if isinstance(place, str) else ""
 
+    # The Golden Records score record. These keys are exactly the fields the
+    # Golden Records Scores API expects: the *_id fields are resolved from the
+    # reference files, the rest are copied or derived from the ExpertArcher
+    # score. (Golden Records devs: this dict is the integration contract.)
     record = {
-        "age_group_id": lookups.age_groups[age_group_name],
-        "class_id": class_id,
-        "date_shot": date_shot,
-        "member_id": lookups.members[ea_name],
+        "age_group_id": lookups.age_groups[age_group_name],  # GR id: Men/Women + age band
+        "class_id": class_id,                                # GR id: bow type
+        "date_shot": date_shot,                              # DD/MM/YYYY (date only)
+        "member_id": lookups.members[ea_name],               # GR id: the archer
         "golds": numbers["golds"],
         "hits": numbers["hits"],
-        "location": location,
-        "qualifying": "252" not in ea_round,
-        "record_qualifying": True,
-        "record_status": ea_tournament,
-        "round_id": round_id,
+        "location": location,                                # free text, from EA "place"
+        "qualifying": "252" not in ea_round,                 # 252 award rounds are not qualifying
+        "record_qualifying": True,                           # always eligible for club records
+        "record_status": ea_tournament,                      # True only for open tournaments
+        "round_id": round_id,                                # GR id: round
         "score": numbers["score"],
-        "status": status,
+        "status": status,                                    # Open Competition / Club Competition / Club Event
         "Xs": xs,
     }
     return record, None
@@ -538,6 +551,7 @@ def _fmt(detail):
 
 
 def build_arg_parser():
+    """Build the command-line parser. See each argument's help for details."""
     parser = argparse.ArgumentParser(
         description="Prepare ExpertArcher scores for the Golden Records Scores API."
     )
