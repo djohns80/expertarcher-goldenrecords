@@ -1,7 +1,7 @@
 # ExpertArcher name -> Golden Records name mappings.
 # Only names that differ by more than capitalisation are listed here; any
-# name not found is matched against rounds.json / bowtypes.json as-is and
-# case-insensitively.
+# name not found is matched against the reference files in golden-records/
+# (rounds.json / bowtypes.json) as-is and case-insensitively.
 
 # --- Bow types ---
 "afb" = "American Flatbow"

@@ -1,0 +1,14 @@
+# API credentials (copied from .env.example). The template is committed; the
+# real file with secrets is not.
+.env
+
+# Member data downloaded from the API (contains personal data)
+golden-records/members.json
+
+# uv / virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.pyc
+.claude

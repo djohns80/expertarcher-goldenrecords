@@ -5,30 +5,48 @@ fields the Golden Records API expects, using reference data for rounds, bow
 classes, age groups and members. Records that cannot be mapped are skipped and
 explained in a summary report so they can be fixed at source.
 
+The Golden Records reference files (rounds.json, bowtypes.json,
+age-groups.json, members.json) are downloaded from the API when missing (or
+with --refresh), using the settings in config.toml. API credentials are read
+from the environment, never a file (see the ENV_* constants). See
+build_arg_parser for all options.
+
 This script reports only; it does not submit anything or write an output file.
 """
 
 import argparse
-import csv
 import json
+import os
+import time
 import tomllib
 from collections import Counter, defaultdict, namedtuple
 from datetime import datetime
 
 # Default input locations, relative to the working directory. All are
-# overridable on the command line (see build_arg_parser).
+# overridable on the command line (see build_arg_parser). The reference data
+# downloaded from Golden Records lives in its own directory, separate from the
+# ExpertArcher input and local config.
+GR_DIR = "golden-records"
 DEFAULT_SCORES = "scores.json"
-DEFAULT_MEMBERS = "Members.csv"
-DEFAULT_AGE_GROUPS = "age-groups.json"
-DEFAULT_ROUNDS = "rounds.json"
-DEFAULT_BOWTYPES = "bowtypes.json"
+DEFAULT_MEMBERS = os.path.join(GR_DIR, "members.json")
+DEFAULT_AGE_GROUPS = os.path.join(GR_DIR, "age-groups.json")
+DEFAULT_ROUNDS = os.path.join(GR_DIR, "rounds.json")
+DEFAULT_BOWTYPES = os.path.join(GR_DIR, "bowtypes.json")
 DEFAULT_MAPPINGS = "mappings.toml"
+DEFAULT_CONFIG = "config.toml"
 
 # Numeric score fields that must be present and integer-parseable.
 NUMERIC_FIELDS = ("score", "hits", "golds")
 
+# Golden Records API credentials are read from the environment, never from a
+# file, so they stay out of source control. Set the API key (preferred), or
+# the username/password pair for Basic Auth.
+ENV_API_KEY = "GOLDEN_RECORDS_API_KEY"
+ENV_USERNAME = "GOLDEN_RECORDS_USERNAME"
+ENV_PASSWORD = "GOLDEN_RECORDS_PASSWORD"
+
 # All the reference lookups needed to map one score, resolved once at startup.
-#   name_map:  ExpertArcher name -> Golden Records name (from mappings.json).
+#   name_map:  ExpertArcher name -> Golden Records name (from mappings.toml).
 #              A single generic map; the field being resolved (round vs bow
 #              type) decides which id table the result is looked up in.
 #   *_ids:     Golden Records name -> Golden Records id (from the official files)
@@ -50,9 +68,8 @@ def load_age_groups(path):
 
 
 def load_members(path):
-    """Return a mapping of member name -> member_id from the members CSV."""
-    with open(path, "r", encoding="utf-8", newline="") as file:
-        return {row["name"]: row["member_id"] for row in csv.DictReader(file)}
+    """Return a mapping of member name -> member_id from the members JSON."""
+    return {row["name"]: row["member_id"] for row in load_json(path)}
 
 
 def load_rounds(path):
@@ -80,6 +97,195 @@ def load_mappings(path):
     """
     with open(path, "rb") as file:  # tomllib requires a binary stream
         return tomllib.load(file)
+
+
+def load_config(path):
+    """Load the Golden Records API config (TOML), or return {} if absent."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, "rb") as file:
+        return tomllib.load(file)
+
+
+class RateLimiter:
+    """Enforces a minimum interval between successive requests.
+
+    Golden Records throttles to 1 request/second (and 20/minute, 200/hour).
+    Spacing requests at least `min_interval` apart satisfies the per-second
+    limit; a single run makes only a handful of requests, so the minute/hour
+    limits are not a concern (the retry logic in `fetch_resource` handles them
+    if they ever are). One shared instance spaces requests across all
+    downloads in a run.
+    """
+
+    def __init__(self, min_interval):
+        self.min_interval = min_interval
+        self._last = None
+
+    def wait(self):
+        if self.min_interval > 0 and self._last is not None:
+            remaining = self.min_interval - (time.monotonic() - self._last)
+            if remaining > 0:
+                time.sleep(remaining)
+        self._last = time.monotonic()
+
+
+def fetch_resource(config, endpoint_key, limiter):
+    """Download a full reference resource from the Golden Records API.
+
+    Pages through the endpoint (authenticated with the configured API key or
+    Basic Auth credentials) accumulating the JSON list from each page until the
+    last page is reached, then returns the combined list.
+    Requests are spaced by `limiter` and retried with backoff on 429/5xx
+    responses. `requests` is imported lazily so the tool still runs offline
+    when the local files are already present.
+    """
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "The 'requests' package is required to download reference data. "
+            "Install dependencies with `uv sync`."
+        ) from exc
+
+    api = config.get("api", {})
+    base_url = api.get("base_url", "").rstrip("/")
+    endpoint = api.get("endpoints", {}).get(endpoint_key, "")
+    auth_kwargs = _build_auth()
+    if not (base_url and endpoint and auth_kwargs):
+        raise RuntimeError(
+            f"Golden Records API is not configured for '{endpoint_key}'. "
+            f"Set base_url and endpoints.{endpoint_key} in {DEFAULT_CONFIG}, and "
+            f"credentials in the environment (${ENV_API_KEY}, or "
+            f"${ENV_USERNAME}/${ENV_PASSWORD})."
+        )
+
+    pg = api.get("pagination", {})
+    page_param = pg.get("page_param", "page")
+    size_param = pg.get("size_param", "pageSize")
+    page_size = pg.get("page_size", 100)
+    page = pg.get("start_page", 1)
+
+    th = api.get("throttle", {})
+    max_retries = th.get("max_retries", 5)
+    backoff = th.get("backoff_seconds", 2.0)
+
+    url = base_url + endpoint
+    records = []
+    while True:
+        response = _get_with_retry(
+            requests, url, auth_kwargs,
+            {page_param: page, size_param: page_size},
+            limiter, endpoint_key, max_retries, backoff,
+        )
+        batch = response.json()
+        records.extend(batch)
+        if _is_last_page(response, page, batch, page_size):
+            break
+        page += 1
+    return records
+
+
+def _build_auth():
+    """Build the requests keyword arguments carrying the API credentials.
+
+    Credentials come from the environment (see the ENV_* constants), never
+    from a file. Two schemes are supported, API key taking precedence when
+    set:
+      - API key: sent as `Authorization: Basic <api_key>` -- the key takes the
+        place of the usual base64 username:password value. Unlike Basic Auth,
+        a club-level key returns the whole membership rather than only the
+        caller's own record.
+      - HTTP Basic Auth: a username/password pair.
+    Returns a dict to splat into requests.get (e.g. {"headers": {...}} or
+    {"auth": (user, pass)}), or {} if no credentials are set.
+    """
+    api_key = os.environ.get(ENV_API_KEY, "")
+    if api_key:
+        return {"headers": {"Authorization": f"Basic {api_key}"}}
+    username = os.environ.get(ENV_USERNAME, "")
+    if username:
+        return {"auth": (username, os.environ.get(ENV_PASSWORD, ""))}
+    return {}
+
+
+def _get_with_retry(requests, url, auth_kwargs, params, limiter, endpoint_key, max_retries, backoff):
+    """GET a page, waiting on the limiter and retrying 429/5xx with backoff.
+
+    `auth_kwargs` carries the credentials (from `_build_auth`) and is splatted
+    into the request. Retries honour a `Retry-After` header (seconds) when the
+    server sends one, otherwise use exponential backoff. Non-retryable errors
+    (e.g. 4xx other than 429) and exhausted retries are raised as a RuntimeError.
+    """
+    for attempt in range(max_retries + 1):
+        limiter.wait()
+        try:
+            response = requests.get(url, params=params, timeout=30, **auth_kwargs)
+        except requests.RequestException as exc:
+            if attempt < max_retries:
+                time.sleep(backoff * (2 ** attempt))
+                continue
+            raise RuntimeError(f"Failed to download '{endpoint_key}' from {url}: {exc}") from exc
+
+        if response.status_code == 429 or response.status_code >= 500:
+            if attempt < max_retries:
+                time.sleep(_retry_delay(response, attempt, backoff))
+                continue
+
+        try:
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to download '{endpoint_key}' from {url}: {exc}") from exc
+        return response
+
+
+def _retry_delay(response, attempt, backoff):
+    """Seconds to wait before a retry: the Retry-After header if present and
+    numeric, otherwise exponential backoff."""
+    retry_after = response.headers.get("Retry-After", "")
+    if retry_after.strip().isdigit():
+        return int(retry_after)
+    return backoff * (2 ** attempt)
+
+
+def _is_last_page(response, page, batch, page_size):
+    """Decide whether the current page is the final page of a paged resource.
+
+    The Golden Records API returns a `paging-headers` header, e.g.
+    {"totalCount":373,"currentPage":1,"totalPages":1,"nextPage":"No", ...};
+    when present, currentPage >= totalPages is authoritative. If the header is
+    missing or unparseable, fall back to "a page shorter than page_size is the
+    last one".
+    """
+    header = response.headers.get("paging-headers")
+    if header:
+        try:
+            info = json.loads(header)
+            current = info.get("currentPage", page)
+            total = info.get("totalPages")
+            if total is not None:
+                return current >= total
+        except (ValueError, TypeError):
+            pass  # fall back to the length heuristic below
+    return len(batch) < page_size
+
+
+def ensure_reference_file(path, endpoint_key, config, refresh, limiter):
+    """Ensure `path` exists, downloading it from the API when missing/refreshing.
+
+    Returns True if the file was (re)downloaded, False if the existing file
+    was used as-is.
+    """
+    if os.path.exists(path) and not refresh:
+        return False
+    records = fetch_resource(config, endpoint_key, limiter)
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(records, file, indent=2, ensure_ascii=False)
+        file.write("\n")
+    return True
 
 
 def format_date(value):
@@ -291,7 +497,7 @@ def build_arg_parser():
     parser.add_argument("--scores", default=DEFAULT_SCORES,
                         help=f"ExpertArcher scores JSON (default: {DEFAULT_SCORES})")
     parser.add_argument("--members", default=DEFAULT_MEMBERS,
-                        help=f"Members CSV export (default: {DEFAULT_MEMBERS})")
+                        help=f"Members JSON (default: {DEFAULT_MEMBERS})")
     parser.add_argument("--age-groups", default=DEFAULT_AGE_GROUPS,
                         help=f"Age groups JSON (default: {DEFAULT_AGE_GROUPS})")
     parser.add_argument("--rounds", default=DEFAULT_ROUNDS,
@@ -301,11 +507,47 @@ def build_arg_parser():
     parser.add_argument("--mappings", default=DEFAULT_MAPPINGS,
                         help=f"ExpertArcher -> Golden Records name mappings TOML "
                              f"(default: {DEFAULT_MAPPINGS})")
+    parser.add_argument("--config", default=DEFAULT_CONFIG,
+                        help=f"Golden Records API config TOML, used to download "
+                             f"reference files (default: {DEFAULT_CONFIG})")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Re-download the reference files from the API even "
+                             "if they already exist locally")
     return parser
+
+
+def load_env():
+    """Load credentials from a local .env file into the environment, if present.
+
+    Uses python-dotenv when available; a missing package or missing file is
+    fine (the credentials can still be set directly in the environment).
+    Existing environment variables are not overridden.
+    """
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError:
+        return
+    load_dotenv()
 
 
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
+    load_env()
+
+    # Download any missing (or, with --refresh, all) reference files first.
+    # One shared limiter spaces every request across all the downloads.
+    config = load_config(args.config)
+    min_interval = config.get("api", {}).get("throttle", {}).get("min_interval_seconds", 1.0)
+    limiter = RateLimiter(min_interval)
+    try:
+        for path, endpoint_key in [(args.rounds, "rounds"),
+                                   (args.bowtypes, "bowtypes"),
+                                   (args.age_groups, "age_groups"),
+                                   (args.members, "members")]:
+            if ensure_reference_file(path, endpoint_key, config, args.refresh, limiter):
+                print(f"Downloaded {path} from the Golden Records API")
+    except RuntimeError as exc:
+        raise SystemExit(f"Error: {exc}")
 
     lookups = Lookups(
         members=load_members(args.members),

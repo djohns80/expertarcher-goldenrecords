@@ -1,0 +1,86 @@
+[
+  {
+    "bow_class": "",
+    "class_archived": false,
+    "class_id": "8910f6dd-0a6b-4255-91a7-b7e876b64f1d",
+    "locale": "GB",
+    "lookup": ""
+  },
+  {
+    "bow_class": "American Flatbow",
+    "class_archived": false,
+    "class_id": "6cc78e0c-2139-4246-bbcc-0fe5b3a9a2eb",
+    "locale": "GB",
+    "lookup": "American Flatbow"
+  },
+  {
+    "bow_class": "Asiatic",
+    "class_archived": false,
+    "class_id": "2eff8936-8e39-436a-ae38-a51c0d887320",
+    "locale": "GB",
+    "lookup": "Asiatic"
+  },
+  {
+    "bow_class": "Barebow",
+    "class_archived": false,
+    "class_id": "ac261bbf-147d-4c7c-b571-8031afb144fa",
+    "locale": "All",
+    "lookup": "Barebow"
+  },
+  {
+    "bow_class": "Bowhunter",
+    "class_archived": false,
+    "class_id": "4d5decec-5b84-4088-aa73-16d71a0b1a48",
+    "locale": "All",
+    "lookup": "Bowhunter"
+  },
+  {
+    "bow_class": "Compound",
+    "class_archived": false,
+    "class_id": "4cd5298a-1220-420d-8a01-5b37e375820e",
+    "locale": "All",
+    "lookup": "Compound"
+  },
+  {
+    "bow_class": "Freestyle",
+    "class_archived": false,
+    "class_id": "87dfd35f-d817-4adc-b887-3c927d94918b",
+    "locale": "All",
+    "lookup": "Freestyle"
+  },
+  {
+    "bow_class": "Hunting Tackle",
+    "class_archived": false,
+    "class_id": "e035dabc-2ab6-4d3d-9ce8-9935310dd341",
+    "locale": "GB",
+    "lookup": "Hunting Tackle"
+  },
+  {
+    "bow_class": "Longbow",
+    "class_archived": false,
+    "class_id": "0dac6d84-bcb4-45ac-9a73-6fccdbd2eb4c",
+    "locale": "All",
+    "lookup": "Longbow"
+  },
+  {
+    "bow_class": "Primitive",
+    "class_archived": false,
+    "class_id": "723499de-4b44-40b7-893f-7ecd1a9cb764",
+    "locale": "All",
+    "lookup": "Primitive"
+  },
+  {
+    "bow_class": "Recurve",
+    "class_archived": false,
+    "class_id": "7e861468-2353-4e11-bd61-9253e8718f11",
+    "locale": "All",
+    "lookup": "Recurve"
+  },
+  {
+    "bow_class": "Traditional",
+    "class_archived": false,
+    "class_id": "51483810-0d6d-4cd7-a70f-4938f06c3c19",
+    "locale": "All",
+    "lookup": "Traditional"
+  }
+]

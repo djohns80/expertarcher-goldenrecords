@@ -1,0 +1,44 @@
+# Golden Records API configuration.
+#
+# Used to download the reference data files (rounds.json, bowtypes.json,
+# age-groups.json, members.json) when they are missing locally, or when app.py
+# is run with --refresh.
+#
+# No secrets live here -- credentials are read from the environment (see the
+# [api] section below), so this file is safe to commit.
+
+[api]
+base_url = "https://api2.archery-records.net/api"
+
+# Credentials are NOT stored here -- they are read from the environment so they
+# stay out of source control. Two schemes are supported, API key first:
+#   - API key (recommended): set GOLDEN_RECORDS_API_KEY. Sent as
+#     "Authorization: Basic <key>". A club-level key returns the whole
+#     membership, whereas Basic Auth returns only the caller's own record.
+#   - HTTP Basic Auth (fallback): set GOLDEN_RECORDS_USERNAME and
+#     GOLDEN_RECORDS_PASSWORD.
+
+[api.endpoints]
+# Path for each reference resource, appended to base_url.
+rounds = "/rounds"
+bowtypes = "/classes"
+age_groups = "/age-groups"
+members = "/members"
+
+[api.pagination]
+# The reference endpoints return a page of records as a JSON list (the same
+# shape saved to the local files). These settings drive the paging loop: pages
+# are requested until one comes back with fewer than page_size records.
+page_param = "pageNumber" # query-string parameter carrying the page number
+size_param = "pageSize"   # query-string parameter carrying the page size
+page_size = 500           # records requested per page
+start_page = 1            # number of the first page (set to 0 if 0-indexed)
+
+[api.throttle]
+# Golden Records throttles to 1/second, 20/minute and 200/hour. Spacing
+# requests >= 1s apart respects the per-second limit; a run makes only a few
+# requests so the minute/hour limits are not reached. If a 429 (or 5xx) does
+# occur, requests are retried with backoff, honouring any Retry-After header.
+min_interval_seconds = 1.0  # minimum gap between requests
+max_retries = 5             # retry attempts on 429/5xx before giving up
+backoff_seconds = 2.0       # base for exponential backoff (2s, 4s, 8s, ...)
