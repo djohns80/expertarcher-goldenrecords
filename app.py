@@ -8,7 +8,8 @@ and explained in a summary report so they can be fixed at source.
 Pipeline (see main() at the bottom):
   1. Fetch reference data from Golden Records (fetch_resource) into the
      golden-records/ files, unless already present. These give us the ids.
-  2. Fetch the scores to process from ExpertArcher (fetch_scores).
+  2. Fetch the scores to process from ExpertArcher (fetch_scores), optionally
+     filtered by archer name (--include-name / --exclude-name, filter_by_name).
   3. Map each score to a Golden Records record (transform_score), resolving
      round / bow-type / member / age-group names to ids (resolve).
   4. Report what mapped and what was skipped, and why (print_report).
@@ -835,6 +836,21 @@ def process(scores, lookups):
     return mapped, skips
 
 
+def filter_by_name(scores, include_name, exclude_name):
+    """Filter fetched scores by ExpertArcher name (exact, case-sensitive match).
+
+    - include_name: keep only scores whose `name` equals it.
+    - exclude_name: drop scores whose `name` equals it.
+    At most one is set (the CLI makes them mutually exclusive). With neither,
+    the scores are returned unchanged.
+    """
+    if include_name is not None:
+        return [s for s in scores if s.get("name") == include_name]
+    if exclude_name is not None:
+        return [s for s in scores if s.get("name") != exclude_name]
+    return scores
+
+
 def print_report(total_read, mapped, skips):
     """Print a human-readable summary of what was parsed and what was skipped."""
     print("=" * 60)
@@ -956,6 +972,13 @@ def build_arg_parser():
                         help="Only fetch scores shot on or after this date")
     parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
                         help="Only fetch scores shot on or before this date")
+    name_filter = parser.add_mutually_exclusive_group()
+    name_filter.add_argument("--include-name", metavar="NAME",
+                             help="Only process scores whose ExpertArcher name "
+                                  "exactly matches NAME")
+    name_filter.add_argument("--exclude-name", metavar="NAME",
+                             help="Process all scores except those whose "
+                                  "ExpertArcher name exactly matches NAME")
     parser.add_argument("--members", default=DEFAULT_MEMBERS,
                         help=f"Members JSON (default: {DEFAULT_MEMBERS})")
     parser.add_argument("--age-groups", default=DEFAULT_AGE_GROUPS,
@@ -1041,6 +1064,18 @@ def main(argv=None):
     except RuntimeError as exc:
         raise SystemExit(f"Error: {exc}")
     print(f"Fetched {len(scores)} scores from the ExpertArcher API")
+
+    # Optionally filter by archer name (exact match) before mapping, so the
+    # filter applies to whichever output follows (submission or --csv).
+    if args.include_name is not None or args.exclude_name is not None:
+        before = len(scores)
+        scores = filter_by_name(scores, args.include_name, args.exclude_name)
+        if args.include_name is not None:
+            print(f"Filtered to {len(scores)} score(s) for name "
+                  f"'{args.include_name}' (from {before}).")
+        else:
+            print(f"Excluded name '{args.exclude_name}': {len(scores)} of "
+                  f"{before} score(s) remain.")
 
     mapped, skips = process(scores, lookups)
     print_report(len(scores), mapped, skips)

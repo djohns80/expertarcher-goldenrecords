@@ -161,8 +161,18 @@ uv run python app.py --refresh --from 2026-07-01 --to 2026-08-01
 # Write a CSV bulk-import file instead of submitting (best for large imports)
 uv run python app.py --csv scores-import.csv --from 2026-07-01 --to 2026-08-01
 
+# Only one archer (exact name match) -- or everyone except one
+uv run python app.py --include-name "Fred Jones" --from 2026-07-01 --to 2026-08-01
+uv run python app.py --exclude-name "Fred Jones" --from 2026-07-01 --to 2026-08-01
+
 uv run python app.py --help    # all options
 ```
+
+`--include-name NAME` processes only scores whose ExpertArcher name matches
+`NAME` exactly; `--exclude-name NAME` processes everyone except that archer.
+The two are mutually exclusive, matching is exact (case-sensitive), and the
+filter is applied to the fetched scores before mapping — so it works the same
+whether you submit or write a CSV.
 
 > Runs submit to Golden Records by default; use `--dry-run` to skip it, or
 > `--csv PATH` to write a bulk-import file instead — see
