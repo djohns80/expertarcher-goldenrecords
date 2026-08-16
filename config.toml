@@ -1,11 +1,10 @@
-# Golden Records API configuration.
+# API configuration. No secrets live here -- all API keys are read from the
+# environment -- so this file is safe to commit.
 #
-# Used to download the reference data files (rounds.json, bowtypes.json,
-# age-groups.json, members.json) when they are missing locally, or when app.py
-# is run with --refresh.
-#
-# No secrets live here -- credentials are read from the environment (see the
-# [api] section below), so this file is safe to commit.
+#   [api]          Golden Records API. Downloads the reference data files
+#                  (rounds.json, bowtypes.json, age-groups.json, members.json)
+#                  when they are missing locally, or with --refresh.
+#   [expertarcher] ExpertArcher API. Fetches the scores to be processed.
 
 [api]
 base_url = "https://api2.archery-records.net/api"
@@ -42,3 +41,19 @@ start_page = 1            # number of the first page (set to 0 if 0-indexed)
 min_interval_seconds = 1.0  # minimum gap between requests
 max_retries = 5             # retry attempts on 429/5xx before giving up
 backoff_seconds = 2.0       # base for exponential backoff (2s, 4s, 8s, ...)
+
+[expertarcher]
+# The scores to process are fetched from here. The API key is read from the
+# environment ($EXPERTARCHER_API_KEY), never stored in this file; it is sent as
+# a query-string parameter (key_param), along with the fixed params below and
+# an optional --from / --to date range. A single request returns all matching
+# scores (the endpoint is not paged).
+base_url = "https://fapi.expertarcher.com"  # scheme + host, e.g. https://api.expertarcher.com
+endpoint = "/club"                          # path appended to base_url
+key_param = "apikey"                        # query-string parameter the API key is sent in
+
+[expertarcher.params]
+# Fixed query-string parameters sent on every request.
+club = "Harlequin Bowmen"  # club identifier
+# Fields to return; these are the score fields the pipeline reads.
+select = "date,round,name,class,gender,bowtype,score,hits,golds,competition,tournament,place,xs,Xs"

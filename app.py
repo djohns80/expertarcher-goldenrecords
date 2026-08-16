@@ -1,15 +1,16 @@
 """Prepare ExpertArcher scores for submission to the Golden Records Scores API.
 
-Reads a list of scores exported from ExpertArcher and maps each one onto the
-fields the Golden Records API expects, using reference data for rounds, bow
-classes, age groups and members. Records that cannot be mapped are skipped and
-explained in a summary report so they can be fixed at source.
+Fetches the list of scores from the ExpertArcher API and maps each one onto
+the fields the Golden Records API expects, using reference data for rounds,
+bow classes, age groups and members. Records that cannot be mapped are skipped
+and explained in a summary report so they can be fixed at source.
 
-The Golden Records reference files (rounds.json, bowtypes.json,
-age-groups.json, members.json) are downloaded from the API when missing (or
-with --refresh), using the settings in config.toml. API credentials are read
-from the environment, never a file (see the ENV_* constants). See
-build_arg_parser for all options.
+Scores come from the ExpertArcher API (the [expertarcher] section of
+config.toml); the reporting window is set with --from / --to. The Golden
+Records reference files (rounds.json, bowtypes.json, age-groups.json,
+members.json) are downloaded from the API when missing (or with --refresh),
+using the [api] section. API keys are read from the environment, never a file
+(see the ENV_* constants). See build_arg_parser for all options.
 
 This script reports only; it does not submit anything or write an output file.
 """
@@ -27,7 +28,6 @@ from datetime import datetime
 # downloaded from Golden Records lives in its own directory, separate from the
 # ExpertArcher input and local config.
 GR_DIR = "golden-records"
-DEFAULT_SCORES = "scores.json"
 DEFAULT_MEMBERS = os.path.join(GR_DIR, "members.json")
 DEFAULT_AGE_GROUPS = os.path.join(GR_DIR, "age-groups.json")
 DEFAULT_ROUNDS = os.path.join(GR_DIR, "rounds.json")
@@ -38,12 +38,13 @@ DEFAULT_CONFIG = "config.toml"
 # Numeric score fields that must be present and integer-parseable.
 NUMERIC_FIELDS = ("score", "hits", "golds")
 
-# Golden Records API credentials are read from the environment, never from a
-# file, so they stay out of source control. Set the API key (preferred), or
-# the username/password pair for Basic Auth.
+# API keys are read from the environment, never from a file, so they stay out
+# of source control. For Golden Records set the API key (preferred) or the
+# username/password pair for Basic Auth; for ExpertArcher set the API key.
 ENV_API_KEY = "GOLDEN_RECORDS_API_KEY"
 ENV_USERNAME = "GOLDEN_RECORDS_USERNAME"
 ENV_PASSWORD = "GOLDEN_RECORDS_PASSWORD"
+ENV_EA_API_KEY = "EXPERTARCHER_API_KEY"
 
 # All the reference lookups needed to map one score, resolved once at startup.
 #   name_map:  ExpertArcher name -> Golden Records name (from mappings.toml).
@@ -184,6 +185,52 @@ def fetch_resource(config, endpoint_key, limiter):
             break
         page += 1
     return records
+
+
+def fetch_scores(config, limiter, date_from=None, date_to=None):
+    """Fetch the scores to process from the ExpertArcher API.
+
+    The API key is sent as a query-string parameter (not a header, unlike
+    Golden Records), alongside the fixed parameters from config (e.g. club,
+    select) and an optional from/to date range. Returns the JSON list of score
+    records, matching the shape the rest of the pipeline expects. `requests` is
+    imported lazily so the "not installed" message is friendly.
+    """
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "The 'requests' package is required to fetch scores. "
+            "Install dependencies with `uv sync`."
+        ) from exc
+
+    ea = config.get("expertarcher", {})
+    base_url = ea.get("base_url", "").rstrip("/")
+    endpoint = ea.get("endpoint", "")
+    key_param = ea.get("key_param", "apikey")
+    api_key = os.environ.get(ENV_EA_API_KEY, "")
+    if not (base_url and endpoint and api_key):
+        raise RuntimeError(
+            f"ExpertArcher API is not configured. Set expertarcher.base_url and "
+            f"expertarcher.endpoint in {DEFAULT_CONFIG}, and ${ENV_EA_API_KEY} in "
+            f"the environment."
+        )
+
+    # Key first, then the fixed params from config, then the optional window.
+    params = {key_param: api_key}
+    params.update(ea.get("params", {}))
+    if date_from:
+        params["from"] = date_from
+    if date_to:
+        params["to"] = date_to
+
+    # Reuse the shared retry policy; the endpoint is not paged.
+    th = config.get("api", {}).get("throttle", {})
+    response = _get_with_retry(
+        requests, base_url + endpoint, {}, params, limiter,
+        "scores", th.get("max_retries", 5), th.get("backoff_seconds", 2.0),
+    )
+    return response.json()
 
 
 def _build_auth():
@@ -494,8 +541,10 @@ def build_arg_parser():
     parser = argparse.ArgumentParser(
         description="Prepare ExpertArcher scores for the Golden Records Scores API."
     )
-    parser.add_argument("--scores", default=DEFAULT_SCORES,
-                        help=f"ExpertArcher scores JSON (default: {DEFAULT_SCORES})")
+    parser.add_argument("--from", dest="date_from", metavar="YYYY-MM-DD",
+                        help="Only fetch scores shot on or after this date")
+    parser.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD",
+                        help="Only fetch scores shot on or before this date")
     parser.add_argument("--members", default=DEFAULT_MEMBERS,
                         help=f"Members JSON (default: {DEFAULT_MEMBERS})")
     parser.add_argument("--age-groups", default=DEFAULT_AGE_GROUPS,
@@ -508,8 +557,9 @@ def build_arg_parser():
                         help=f"ExpertArcher -> Golden Records name mappings TOML "
                              f"(default: {DEFAULT_MAPPINGS})")
     parser.add_argument("--config", default=DEFAULT_CONFIG,
-                        help=f"Golden Records API config TOML, used to download "
-                             f"reference files (default: {DEFAULT_CONFIG})")
+                        help=f"API config TOML for ExpertArcher (scores) and "
+                             f"Golden Records (reference files) "
+                             f"(default: {DEFAULT_CONFIG})")
     parser.add_argument("--refresh", action="store_true",
                         help="Re-download the reference files from the API even "
                              "if they already exist locally")
@@ -556,7 +606,12 @@ def main(argv=None):
         round_ids=load_rounds(args.rounds),
         class_ids=load_bowtypes(args.bowtypes),
     )
-    scores = load_json(args.scores)
+
+    try:
+        scores = fetch_scores(config, limiter, args.date_from, args.date_to)
+    except RuntimeError as exc:
+        raise SystemExit(f"Error: {exc}")
+    print(f"Fetched {len(scores)} scores from the ExpertArcher API")
 
     records, skips = process(scores, lookups)
     print_report(len(scores), records, skips)
