@@ -1,0 +1,181 @@
+import json
+import csv
+from collections import defaultdict
+from datetime import datetime
+
+
+with open("age-groups.json", "r") as file:
+    age_groups_list = json.load(file)
+age_groups = {age_group["age_group"]: age_group["age_group_id"] for age_group in age_groups_list}
+
+members = {}
+with open("members.csv", "r") as file:
+    csv_reader = csv.DictReader(file)
+    members = {r["name"]: r["member_id"] for r in csv_reader}
+
+# members["Dean"] = members["Dean Middlemore"]
+# members["NicoleThompson"] = members["Nicole Thompson"]
+# members["Graham Pinl"] = members["Graham Pink"]
+# members["B Taylor"] = members["Brian Taylor"]
+
+classes = {
+    "afb": "6cc78e0c-2139-4246-bbcc-0fe5b3a9a2eb",
+    "barebow": "ac261bbf-147d-4c7c-b571-8031afb144fa",
+    "compound": "4cd5298a-1220-420d-8a01-5b37e375820e",
+    "longbow": "0dac6d84-bcb4-45ac-9a73-6fccdbd2eb4c",
+    "recurve": "7e861468-2353-4e11-bd61-9253e8718f11",
+}
+rounds = {
+    "252 10yds": "33ee7402-8b02-413a-85e0-c14e576aa4dc",
+    "252 20yds": "6ed4796e-174c-41ff-9ffd-82947a1c6615",
+    "252 30yds": "10d6306a-c991-4f2b-a60f-823e97109a98",
+    "252 40yds": "fe486231-84ce-415d-af77-f7b8dce79859",
+    "252 50yds": "07093a7f-27bd-417a-9885-37a5030f628a",
+    "252 60yds": "1797cf94-2788-4425-a5d1-2877c476ab31",
+    "252 80yds": "387f9466-8139-49fe-b06d-c44162bcaf04",
+    "252 100yds": "d6b8e3a0-0f4d-4974-ac32-e7a092f0be55",
+    "Albion": "8cb84fbd-c181-4e68-862a-1c43484ef239",
+    "Bristol I": "6a74f250-87dc-4548-8ede-0a951c588bcd",
+    "Bristol II": "b9ea4cf4-65e5-42a5-b51a-598ee7f3d63f",
+    "Bristol III": "92773de1-eae7-44bb-9906-4a2b89bb0e80",
+    "Bristol IV": "7b2642b8-efa9-4dac-88f1-1e9ae05da11d",
+    "Bristol V": "4146220e-0cbe-4252-affc-81dd7a5ce9a0",
+    "Clout 80yds": "2556f94f-79cc-4705-92b4-6bfb9fc6261f",
+    "Clout 100yds": "d423e9bb-6fd8-4b13-a0e5-078fe06ec55e",
+    "Clout 120yds": "0308b867-1a5d-449d-a632-02e7f161484e",
+    "Clout 140yds": "957abd90-5b91-47df-8f96-9e2917610dd6",
+    "Clout 180yds": "a845f043-a87b-4cf0-8037-06f01e43f987",
+    "Clout Double 80yds": "89d4ab53-5ff9-4eea-828a-b43798e3e36b",
+    "Clout Double 100yds": "70e2d40b-df1b-4815-863e-13aead77fb50",
+    "Clout Double 120yds": "7b1d56f4-b52c-408b-b491-7d46b5e52e1e",
+    "Clout Double 140yds": "48721182-a43c-43b4-9c85-7ced0dd6f2bf",
+    "Clout Double 180yds": "cb54af85-f521-45fe-beeb-16fede892b8b",
+    "Frostbite": "ba0aa21b-5692-4858-835c-9b7cf896741c",
+    "Hereford": "69d7f361-2e65-46b2-b976-7a930e662193",
+    "Long Metric (90m)": "10221b58-c0c6-42fa-a251-ef57894938b7",
+    "Long Metric (70m)": "d3867b27-d286-441b-8887-d21370a670e1",
+    "Long Metric I": "d3867b27-d286-441b-8887-d21370a670e1",
+    "Long Metric II": "ac5ecc8f-e2f1-473f-8ebd-44e68c2815cf",
+    "Long Metric III": "ce16b4ce-d538-4735-83ee-336b317cca53",
+    "Long Metric IV": "c3a9eb63-48fc-4ab2-92b7-d8d02a9eaa5d",
+    "Long Metric V": "bd1039d3-625f-4eb9-90f1-2cf1b7adc06b",
+    "Metric 122-50": "58d6ec90-50bd-4d97-bb64-4a25267d1a15",
+    "Metric 122-40": "2609f66f-fbb6-4450-8fdf-6da4643cc9d6",
+    "Metric 122-30": "60434616-08bb-4a2e-b012-8a014545b1b7",
+    "New National": "3bfe8037-a324-4cf0-b501-1661aea9cd9c",
+    "National (Long)": "cc6464db-7c96-4f69-bc9d-8c20e99d4dea",
+    "National": "3d1b65e7-1c12-4a50-bef8-c6a5b319bb90",
+    "National (Short)": "dfa8667b-7b7c-4861-8445-066d486cd3d3",
+    "National 50": "dfa8667b-7b7c-4861-8445-066d486cd3d3",
+    "National 40": "53c28b2e-2e55-4846-970a-14dd460da524",
+    "National 30": "a95b115a-77ff-4666-b888-1417e1e844fe",
+    "Portsmouth": "cd4b0044-ff00-4d06-95b5-ab399ba79d14",
+    "Short Metric": "5387e957-a650-4544-aa20-36100e934efc",
+    "Short Metric I": "5387e957-a650-4544-aa20-36100e934efc",
+    "Short Metric II": "d8bed1c0-0207-462a-94ab-b55e4e053961",
+    "Short Metric III": "0d2bd886-7412-4b9c-993f-4d809478c372",
+    "Short Metric IV": "291a4b81-eec3-4d1f-8fdc-0eecde08a059",
+    "Short Metric V": "41ba57c5-32ae-4f40-851d-904964e0dc16",
+    "St. Nicholas": "ef8ae7e7-ab98-4b44-9ea4-1f6e25a3f4bb",
+    "Stafford": "2cbe77de-563c-47bf-89f9-83869df8fefe",
+    "WA 18m": "abf23198-08dc-4094-a2d7-01ed5f948d9c",
+    "WA 25m": "ee10450b-eb7b-4042-8be1-e96137abbce3",
+    "WA 50m": "58d6ec90-50bd-4d97-bb64-4a25267d1a15",
+    "WA 50m (122cm)": "58d6ec90-50bd-4d97-bb64-4a25267d1a15",
+    "WA 60m": "cc8568c2-37a7-4eca-829a-9da8d4c48043",
+    "WA 70m": "99fd96bb-d240-42f1-aec3-319b54915ef1",
+    "WA 900": "7c31e7e1-a44a-49ee-bf38-c2dc08d6545f",
+    "WA Clout 185m": "2dc14774-054f-400e-8010-2fd6802ac118",
+    "WA Clout 165m": "b4d5bb1a-a7ad-420e-a7a4-88c1592c0b51",
+    "WA Clout 125m": "8ad42186-3d90-4297-b9ff-2585fd9a5248",
+    "WA Clout 110m": "31d1a4a1-3106-439b-b9da-5d314e791dfa",
+    "WA Clout 90m": "f14a3f47-f19f-4e5d-a10d-1956f1b1f981",
+    "WA Clout 75m": "8788c841-7545-4ba6-8d37-85f59651fca4",
+    "WA Clout Double 185m": "a9f1e7c3-10e2-4038-bf59-b7c8e9f3c19c",
+    "WA Clout Double 165m": "4c51f46e-2b9e-4db4-b063-666085d55e8b",
+    "WA Clout Double 125m": "d4655d92-020f-49be-91b3-04604414cb4b",
+    "WA Clout Double 110m": "0467f3dc-245c-4f7a-8e81-9219aea23f2b",
+    "WA Clout Double 90m": "93660300-e9c1-4606-bcce-d04da72ec651",
+    "WA Clout Double 75m": "acc6dd69-97aa-495f-9d09-46a68a1b5701",
+    "Worcester": "b8da4cc9-d80a-455f-912f-72f38468c87e",
+    "New Warwick": "9c343084-a6a6-4d18-aec8-313865cdd591",
+    "Long Warwick": "42bda374-8270-4ae6-9684-a0b23d83746a",
+    "Warwick": "2d53a3a1-84b4-463a-a140-23a95ce38f42",
+    "Warwick 50": "374376a7-b7d8-49cf-bae8-17f16d62cc59",
+    "Warwick 40": "bc9bbaa8-ed93-4d90-a095-6153050760a3",
+    "Warwick 30": "9611bee1-fbe1-425f-83f5-2a514bf8db4a",
+    "New Western": "48575aeb-69f1-42c9-9219-09c4a6313442",
+    "Long Western": "866104fa-cc0a-4e3f-b2e9-2d3886fae167",
+    "Western": "0c6db0a7-4f50-4192-b7ac-1b462a15ae6d",
+    "Western 50": "ac0e1739-57ca-4e5a-a27f-5db203d1c587",
+    "Western 40": "2c2e06b4-1f26-4acd-bb93-618899371183",
+    "Western 30": "6163e858-6b59-4c0c-a9b7-38b0f3f2077c",
+    "St George": "19b31358-2ac1-4fdc-9e7b-1685da47f456",
+    "Windsor": "c11676e5-1546-4e59-9313-237b69e4b92c",
+    "Windsor 50": "8acbc25c-2a4a-472f-92bf-682e736b92fd",
+    "Windsor 40": "9d796c42-bda5-47fb-b3bb-71a4aec0c485",
+    "Windsor 30": "4bd144fc-dd17-474e-af78-1edbf4771af7",
+    "York": "a8795e55-bc42-4212-b52c-3f58f791dc1e",
+    "Vegas": "b305a1b5-0a22-4d82-aa48-96e28e8feb09",
+    "Vegas 300": "ebeb059f-f640-434a-8dea-90fc7cafb8f2",
+}
+
+
+def get_age_group(gender, age):
+    if gender == "male":
+        return f'Men {("" if age == "senior" else age.upper())}'.strip()
+    elif gender == "female":
+        return f'Women {("" if age == "senior" else age.upper())}'.strip()
+    else:
+        return ""
+
+
+with open("scores.json", "r") as file:
+    data = json.load(file)
+
+print("Records read:", len(data))
+
+score_records = []
+unmapped_data = defaultdict(set)
+for score in data:
+    ea_round = score["round"]
+    if ea_round not in rounds:
+        unmapped_data["rounds"].add(ea_round)
+        continue
+    ea_bowtype = score["bowtype"]
+    if ea_bowtype not in classes:
+        unmapped_data["bowtype"].add(ea_bowtype)
+        continue
+    ea_name = score["name"]
+    if ea_name not in members:
+        unmapped_data["name"].add(ea_name)
+        continue
+    ea_tournament = score.get("tournament", False)
+    ea_competition = score.get("competition", False)
+    status = "Club Event"
+    if ea_tournament:
+        status = "Open Competition"
+    elif ea_competition:
+        status = "Club Competition"
+    ea_place = score.get("place")
+    location = ea_place if ea_place else ""
+
+    score_records.append({
+        "age_group_id": age_groups[get_age_group(score["gender"], score["class"])],
+        "class_id": classes[score["bowtype"]],
+        "date_shot": datetime.fromisoformat(score["date"]).strftime("%d/%m/%Y"),
+        "member_id": members[ea_name],
+        "golds": int(score["golds"]),
+        "hits": int(score["hits"]),
+        "location": location,
+        "qualifying": False if "252" in score["round"] else True,
+        "record_qualifying": True,
+        "record_status": ea_tournament,
+        "round_id": rounds[ea_round],
+        "score": int(score["score"]),
+        "status": status,
+        "Xs": max(int(score.get("xs", 0)), int(score.get("Xs", 0))),
+    })
+
+print("unmapped_data", unmapped_data)
+print("Records parsed: ", len(score_records))
