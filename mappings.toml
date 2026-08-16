@@ -1,7 +1,15 @@
-# ExpertArcher name -> Golden Records name mappings.
-# Only names that differ by more than capitalisation are listed here; any
-# name not found is matched against the reference files in golden-records/
-# (rounds.json / bowtypes.json) as-is and case-insensitively.
+# ExpertArcher -> Golden Records name mappings.
+#
+# [names]           round & bow-type name overrides. Only names that differ by
+#                   more than capitalisation are listed; any name not found is
+#                   matched against the reference files in golden-records/
+#                   (rounds.json / bowtypes.json) as-is and case-insensitively.
+# [classifications] ExpertArcher classification -> Golden Records classification
+#                   name, for the CSV import's Classification column. An
+#                   ExpertArcher classification not listed here is left blank
+#                   (Golden Records can compute it on import).
+
+[names]
 
 # --- Bow types ---
 "afb" = "American Flatbow"
@@ -38,3 +46,32 @@
 "WA Clout Double 110m" = "Double WA Clout 110m"
 "WA Clout Double 90m" = "Double WA Clout 90m"
 "WA Clout Double 75m" = "Double WA Clout 75m"
+
+[classifications]
+# ExpertArcher classification -> Golden Records classification name. The
+# right-hand names follow the Archery GB standard; the outdoor ones and
+# "Indoor Bowman ..." are confirmed by Golden Records' sample score-records.csv.
+# The four indoor Archer / Indoor Master Bowman names (marked below) match the
+# standard naming but are not in the sample -- worth confirming with a small
+# test import.
+
+# --- Outdoor ---
+"1st class" = "Archer 1st Class"
+"2nd class" = "Archer 2nd Class"
+"3rd class" = "Archer 3rd Class"
+"Bowman 1st class" = "Bowman 1st Class"
+"Bowman 2nd class" = "Bowman 2nd Class"
+"Bowman 3rd class" = "Bowman 3rd Class"
+"Master Bowman" = "Master Bowman"
+"Grand Master Bowman" = "Grand Master Bowman"
+"Elite Master Bowman" = "Elite Master Bowman"
+
+# --- Indoor ---
+"IA1" = "Indoor Archer 1st Class"
+"IA2" = "Indoor Archer 2nd Class"
+"IA3" = "Indoor Archer 3rd Class"
+"IB1" = "Indoor Bowman 1st Class"
+"IB2" = "Indoor Bowman 2nd Class"
+"IB3" = "Indoor Bowman 3rd Class"
+"IMB" = "Indoor Master Bowman"
+"IGMB" = "Indoor Grand Master Bowman"

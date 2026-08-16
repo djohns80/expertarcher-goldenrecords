@@ -8,6 +8,10 @@ golden-records/members.json
 # Full detail of rejected submissions, written per run for review
 submission-errors.log
 
+# Generated CSV bulk-import files (contain member names). The committed
+# score-records.csv is Golden Records' fake-data sample, so it is not matched.
+*-import.csv
+
 # uv / virtual environment
 .venv/
 

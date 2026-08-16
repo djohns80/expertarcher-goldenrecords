@@ -31,10 +31,16 @@ Rejections continue past (one bad record does not block the rest) and are split
 into duplicates (already submitted -- benign) and genuine errors. This writes
 live data, so runs submit by default -- pass --dry-run to fetch, map and report
 without POSTing anything.
+
+For a large historical import, --csv PATH instead writes the mapped records to
+a Golden Records CSV bulk-import file (and submits nothing): one upload avoids
+the API's 200-requests/hour throttle. The same records feed either output --
+api_record() renders the JSON body, csv_row() the CSV row.
 README.md has the full integration overview, field mapping and setup.
 """
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -71,6 +77,26 @@ STATUS_CLUB_EVENT = 2
 STATUS_CLUB_COMPETITION = 3
 STATUS_OPEN_COMPETITION = 4
 
+# The JSON API sends `status` as the enum integer above; the CSV bulk-import
+# format uses the equivalent text label instead. Same mapping, two renderings.
+STATUS_LABELS = {
+    STATUS_PRACTICE: "Practice",
+    STATUS_CLUB_EVENT: "Club Event",
+    STATUS_CLUB_COMPETITION: "Club Competition",
+    STATUS_OPEN_COMPETITION: "Open Competition",
+}
+
+# Column order of the Golden Records CSV bulk-import file (from their sample
+# score-records.csv). The file ends with a single `END` sentinel row. Columns
+# we have no ExpertArcher source for are written blank (Golden Records fills
+# Handicap/Classification on import; Affiliation/Verified are optional).
+CSV_HEADER = [
+    "Date", "Name", "Score", "Hits", "Golds", "Xs", "Handicap", "Classification",
+    "Location", "Class", "Age Group", "Round", "Type", "Record Status",
+    "Qualifying", "Status", "Affiliation", "Affiliation Expiry",
+    "Affiliation ID", "Verified",
+]
+
 # The Scores API returns this exact message (in the response body's `errors`
 # list) when a matching score is already present. It is not a real failure --
 # it just means the score was submitted before -- so it is counted and reported
@@ -89,10 +115,35 @@ ENV_EA_API_KEY = "EXPERTARCHER_API_KEY"
 #   name_map:  ExpertArcher name -> Golden Records name (from mappings.toml).
 #              A single generic map; the field being resolved (round vs bow
 #              type) decides which id table the result is looked up in.
-#   *_ids:     Golden Records name -> Golden Records id (from the official files)
+#   round_ids/class_ids: lower-cased Golden Records name -> a details dict
+#              carrying the canonical name and id (and, for rounds, the
+#              Indoor/Outdoor type). Keyed lower-case for case-insensitive
+#              lookup (see resolve / load_rounds / load_bowtypes).
+#   classification_map: ExpertArcher classification -> Golden Records
+#              classification name, for the CSV Classification column
+#              (from mappings.toml); unlisted classifications map to blank.
 Lookups = namedtuple(
     "Lookups",
-    "members age_groups name_map round_ids class_ids",
+    "members age_groups name_map round_ids class_ids classification_map",
+)
+
+# One fully-resolved score, independent of the output format. transform_score
+# produces these; api_record() renders one as the JSON body for POST /scores,
+# and csv_row() renders one as a Golden Records CSV import row. Sharing this
+# intermediate keeps both outputs (and the skip/validation logic) in step.
+#   *_id / *_name: the resolved Golden Records id and its canonical name (the
+#                  API uses the ids, the CSV uses the names).
+#   date:          a datetime, formatted per target (ISO for the API,
+#                  DD/MM/YYYY for the CSV).
+#   status:        the ScoreStatusOptions enum int (STATUS_LABELS maps it to
+#                  the CSV text label).
+#   handicap/classification: optional CSV-only columns copied from ExpertArcher
+#                  when present (blank otherwise); the API has no such fields.
+Mapped = namedtuple(
+    "Mapped",
+    "member_id member_name round_id round_name round_type class_id class_name "
+    "age_group_id age_group_name date score hits golds xs location status "
+    "record_status qualifying record_qualifying handicap classification",
 )
 
 # One rejected submission: its position in the submitted list, the API's
@@ -123,30 +174,51 @@ def load_members(path):
 
 
 def load_rounds(path):
-    """Return a mapping of Golden Records round name -> round_id.
+    """Return a mapping of lower-cased round name -> its details.
 
-    Keyed by lower-cased name so lookups are case-insensitive (see `resolve`).
+    Each value is {"name", "id", "type"}: the canonical Golden Records name
+    (preserving its casing), the round_id, and the Indoor/Outdoor type (used
+    for the CSV `Type` column). Keyed by lower-cased name so lookups are
+    case-insensitive (see `resolve`).
     """
-    return {row["round"].lower(): row["round_id"] for row in load_json(path)}
+    return {row["round"].lower(): {"name": row["round"],
+                                   "id": row["round_id"],
+                                   "type": row.get("type", "")}
+            for row in load_json(path)}
 
 
 def load_bowtypes(path):
-    """Return a mapping of Golden Records bow class name -> class_id.
+    """Return a mapping of lower-cased bow class name -> its details.
 
-    Keyed by lower-cased name so lookups are case-insensitive (see `resolve`).
+    Each value is {"name", "id"}: the canonical Golden Records name (preserving
+    its casing) and the class_id. Keyed by lower-cased name so lookups are
+    case-insensitive (see `resolve`).
     """
-    return {row["bow_class"].lower(): row["class_id"] for row in load_json(path)}
+    return {row["bow_class"].lower(): {"name": row["bow_class"],
+                                       "id": row["class_id"]}
+            for row in load_json(path)}
 
 
 def load_mappings(path):
-    """Return the ExpertArcher name -> Golden Records name map (TOML).
+    """Load the ExpertArcher -> Golden Records mappings (TOML).
 
-    A single flat map covering both rounds and bow types; the code resolves
-    each mapped name against the appropriate id table by context. TOML is used
-    so the file can carry comments grouping the entries by type.
+    Returns (name_map, classification_map):
+      - name_map: round & bow-type name overrides (the [names] table). The code
+        resolves each mapped name against the appropriate id table by context.
+        A legacy flat file (entries at the top level, no [names] header) is
+        still accepted.
+      - classification_map: ExpertArcher classification -> Golden Records
+        classification name (the [classifications] table), for the CSV import's
+        Classification column; an unlisted classification is left blank.
     """
     with open(path, "rb") as file:  # tomllib requires a binary stream
-        return tomllib.load(file)
+        data = tomllib.load(file)
+    if "names" in data:
+        name_map = data["names"]
+    else:  # legacy flat file: top-level string entries are the name map
+        name_map = {key: value for key, value in data.items()
+                    if isinstance(value, str)}
+    return name_map, data.get("classifications", {})
 
 
 def load_config(path):
@@ -519,18 +591,20 @@ def ensure_reference_file(path, endpoint_key, config, refresh, limiter,
     return True
 
 
-def format_date(value):
-    """Format an ExpertArcher datetime as an ISO date-only YYYY-MM-DD string.
+def parse_ea_date(value):
+    """Parse an ExpertArcher datetime string, or return None if unparseable.
 
-    ExpertArcher supplies a full datetime, but the Golden Records `date_shot`
-    field is a plain date and expects the ISO form (YYYY-MM-DD); other formats
-    are rejected as "No valid entry in Date Shot field." Returns the original
-    value unchanged if it cannot be parsed, so the caller can detect that.
+    ExpertArcher supplies a full datetime; both output formats need only the
+    date part, formatted differently (the API's `date_shot` wants ISO
+    YYYY-MM-DD -- other forms are rejected as "No valid entry in Date Shot
+    field." -- while the CSV import wants DD/MM/YYYY). Returning the parsed
+    datetime lets each renderer format it, and None lets the caller skip a
+    score whose date cannot be parsed.
     """
     try:
-        return datetime.fromisoformat(value).strftime("%Y-%m-%d")
+        return datetime.fromisoformat(value)
     except (TypeError, ValueError):
-        return value
+        return None
 
 
 def get_age_group(gender, age_class):
@@ -546,25 +620,26 @@ def get_age_group(gender, age_class):
     return f"{prefix} {suffix}".strip()
 
 
-def resolve(ea_name, name_map, name_to_id, kind):
-    """Resolve an ExpertArcher name to a Golden Records id.
+def resolve(ea_name, name_map, name_to_entry, kind):
+    """Resolve an ExpertArcher name to its Golden Records details.
 
     The name is first translated via the mappings; names not listed there are
     used as-is (many match Golden Records exactly, so only the differences are
     kept in the mappings file). The resulting name is then looked up in the
-    official id table, case-insensitively (the id tables are keyed by
+    official reference table, case-insensitively (the tables are keyed by
     lower-cased name), so names differing only by capitalisation need no
     mapping.
 
-    Returns (id, None) on success, or (None, reason) where reason is a
-    (category, detail) tuple for the report:
+    Returns (entry, None) on success -- where entry is the details dict from
+    load_rounds / load_bowtypes ({"name", "id", ...}) -- or (None, reason)
+    where reason is a (category, detail) tuple for the report:
       - "unmatched <kind>": the name is unknown to both the mappings and
         Golden Records, so a mapping needs adding.
       - "unknown Golden Records <kind>": a mapping exists but points at a name
         Golden Records does not recognise, so the mapping is wrong.
     """
     gr_name = name_map.get(ea_name, ea_name)
-    found = name_to_id.get(gr_name.lower()) if isinstance(gr_name, str) else None
+    found = name_to_entry.get(gr_name.lower()) if isinstance(gr_name, str) else None
     if found is not None:
         return found, None
     if ea_name in name_map:  # explicitly mapped, but to a non-existent name
@@ -573,23 +648,24 @@ def resolve(ea_name, name_map, name_to_id, kind):
 
 
 def transform_score(score, lookups):
-    """Map one ExpertArcher score onto a Golden Records API record.
+    """Map one ExpertArcher score onto a resolved `Mapped` record.
 
     Rounds and bow types are resolved via `resolve`: the ExpertArcher name is
     translated to a Golden Records name via the mappings (or used as-is if not
-    listed), then that name is resolved to an id via the official reference
-    files.
+    listed), then that name is resolved to its id (and, for rounds, its type)
+    via the official reference files. The result is format-independent --
+    api_record() renders it for POST /scores and csv_row() for the CSV import.
 
-    Returns (record, None) on success, or (None, reason) if the score cannot
+    Returns (mapped, None) on success, or (None, reason) if the score cannot
     be mapped. `reason` is a (category, detail) tuple used by the report.
     """
     ea_round = score.get("round")
-    round_id, reason = resolve(ea_round, lookups.name_map, lookups.round_ids, "round")
+    round_entry, reason = resolve(ea_round, lookups.name_map, lookups.round_ids, "round")
     if reason is not None:
         return None, reason
 
     ea_bowtype = score.get("bowtype")
-    class_id, reason = resolve(ea_bowtype, lookups.name_map, lookups.class_ids, "bow type")
+    class_entry, reason = resolve(ea_bowtype, lookups.name_map, lookups.class_ids, "bow type")
     if reason is not None:
         return None, reason
 
@@ -610,8 +686,8 @@ def transform_score(score, lookups):
         return None, ("invalid number", str(exc))
 
     raw_date = score.get("date")
-    date_shot = format_date(raw_date)
-    if date_shot == raw_date:  # unchanged means it could not be parsed
+    date = parse_ea_date(raw_date)
+    if date is None:
         return None, ("invalid date", repr(raw_date))
 
     ea_tournament = bool(score.get("tournament", False))
@@ -626,55 +702,146 @@ def transform_score(score, lookups):
     place = score.get("place")
     location = place.strip() if isinstance(place, str) else ""
 
-    # The Golden Records score record. These keys are exactly the fields the
-    # Golden Records Scores API expects: the *_id fields are resolved from the
-    # reference files, the rest are copied or derived from the ExpertArcher
-    # score. (Golden Records devs: this dict is the integration contract.)
-    record = {
-        "age_group_id": lookups.age_groups[age_group_name],  # GR id: Men/Women + age band
-        "class_id": class_id,                                # GR id: bow type
-        "date_shot": date_shot,                              # ISO YYYY-MM-DD (date only)
-        "member_id": lookups.members[ea_name],               # GR id: the archer
-        "golds": numbers["golds"],
-        "hits": numbers["hits"],
-        "location": location,                                # free text, from EA "place"
-        "qualifying": "252" not in ea_round,                 # 252 award rounds are not qualifying
-        "record_qualifying": True,                           # always eligible for club records
-        "record_status": ea_tournament,                      # True only for open tournaments
-        "round_id": round_id,                                # GR id: round
-        "score": numbers["score"],
-        "status": status,                                    # ScoreStatusOptions enum: 2=Club Event, 3=Club Competition, 4=Open Competition
-        "user_1": USER_1_TAG,                                # constant tag marking the ExpertArcher integration as source
-        "Xs": xs,
+    mapped = Mapped(
+        member_id=lookups.members[ea_name],
+        member_name=ea_name,
+        round_id=round_entry["id"],
+        round_name=round_entry["name"],
+        round_type=round_entry.get("type", ""),
+        class_id=class_entry["id"],
+        class_name=class_entry["name"],
+        age_group_id=lookups.age_groups[age_group_name],
+        age_group_name=age_group_name,
+        date=date,
+        score=numbers["score"],
+        hits=numbers["hits"],
+        golds=numbers["golds"],
+        xs=xs,
+        location=location,
+        status=status,
+        record_status=ea_tournament,               # True only for open tournaments
+        qualifying="252" not in ea_round,           # 252 award rounds are not qualifying
+        record_qualifying=True,                     # always eligible for club records
+        # CSV-only columns (the API has no such fields). Handicap copies the
+        # ExpertArcher value when present. Classification is translated to the
+        # Golden Records name via the mappings; an unlisted value is left blank.
+        handicap=_opt_str(score.get("handicap")),
+        classification=lookups.classification_map.get(
+            score.get("classification") or "", ""),
+    )
+    return mapped, None
+
+
+def _opt_str(value):
+    """Render an optional value as a string, or "" when it is absent/None."""
+    return "" if value is None else str(value)
+
+
+def api_record(mapped):
+    """Render a Mapped score as the JSON body for POST /scores.
+
+    These keys are exactly the fields the Golden Records Scores API expects:
+    the *_id fields are the resolved reference ids, `status` is the
+    ScoreStatusOptions enum int, and `date_shot` is ISO YYYY-MM-DD.
+    (Golden Records devs: this dict is the integration contract.)
+    """
+    return {
+        "age_group_id": mapped.age_group_id,             # GR id: Men/Women + age band
+        "class_id": mapped.class_id,                     # GR id: bow type
+        "date_shot": mapped.date.strftime("%Y-%m-%d"),   # ISO YYYY-MM-DD (date only)
+        "member_id": mapped.member_id,                   # GR id: the archer
+        "golds": mapped.golds,
+        "hits": mapped.hits,
+        "location": mapped.location,                     # free text, from EA "place"
+        "qualifying": mapped.qualifying,
+        "record_qualifying": mapped.record_qualifying,
+        "record_status": mapped.record_status,
+        "round_id": mapped.round_id,                     # GR id: round
+        "score": mapped.score,
+        "status": mapped.status,                         # enum: 2=Club Event, 3=Club Competition, 4=Open Competition
+        "user_1": USER_1_TAG,                            # constant tag marking the ExpertArcher integration as source
+        "Xs": mapped.xs,
     }
-    return record, None
+
+
+def csv_row(mapped):
+    """Render a Mapped score as one Golden Records CSV import row (see CSV_HEADER).
+
+    Uses the reference *names* (not ids), a DD/MM/YYYY date, uppercase
+    TRUE/FALSE booleans and the `status` text label. Columns with no
+    ExpertArcher source (Affiliation/Verified) are left blank; Handicap and
+    Classification carry through only when ExpertArcher supplied them.
+    """
+    return [
+        mapped.date.strftime("%d/%m/%Y"),
+        mapped.member_name,
+        mapped.score,
+        mapped.hits,
+        mapped.golds,
+        mapped.xs,
+        mapped.handicap,
+        mapped.classification,
+        mapped.location,
+        mapped.class_name,                  # CSV "Class" is the bow type
+        mapped.age_group_name,
+        mapped.round_name,
+        mapped.round_type,                  # Indoor/Outdoor, from rounds.json
+        _csv_bool(mapped.record_status),
+        _csv_bool(mapped.qualifying),
+        STATUS_LABELS[mapped.status],
+        "",                                 # Affiliation
+        "",                                 # Affiliation Expiry
+        "",                                 # Affiliation ID
+        "",                                 # Verified
+    ]
+
+
+def _csv_bool(value):
+    """Render a boolean as the uppercase TRUE/FALSE the CSV import expects."""
+    return "TRUE" if value else "FALSE"
+
+
+def write_csv(path, mapped_records):
+    """Write mapped scores to a Golden Records CSV import file.
+
+    Writes the header row (CSV_HEADER), one row per mapped score, then the
+    trailing `END` sentinel row the importer expects. Overwrites any existing
+    file at `path`.
+    """
+    with open(path, "w", encoding="utf-8", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(CSV_HEADER)
+        for mapped in mapped_records:
+            writer.writerow(csv_row(mapped))
+        writer.writerow(["END"] + [""] * (len(CSV_HEADER) - 1))
 
 
 def process(scores, lookups):
-    """Transform every score, returning (records, skips).
+    """Transform every score, returning (mapped, skips).
 
-    `skips` is a list of (category, detail, archer) tuples, one per skipped
-    score, ready for the report.
+    `mapped` is a list of Mapped records (see transform_score); `skips` is a
+    list of (category, detail, archer) tuples, one per skipped score, ready
+    for the report.
     """
-    records = []
+    mapped = []
     skips = []
     for score in scores:
         record, reason = transform_score(score, lookups)
         if reason is None:
-            records.append(record)
+            mapped.append(record)
         else:
             category, detail = reason
             skips.append((category, detail, score.get("name", "?")))
-    return records, skips
+    return mapped, skips
 
 
-def print_report(total_read, records, skips):
+def print_report(total_read, mapped, skips):
     """Print a human-readable summary of what was parsed and what was skipped."""
     print("=" * 60)
     print("ExpertArcher -> Golden Records: processing report")
     print("=" * 60)
     print(f"Records read:    {total_read}")
-    print(f"Records parsed:  {len(records)}")
+    print(f"Records parsed:  {len(mapped)}")
     print(f"Records skipped: {len(skips)}")
 
     if not skips:
@@ -810,6 +977,11 @@ def build_arg_parser():
     parser.add_argument("--dry-run", action="store_true",
                         help="Fetch, map and report, but do NOT submit anything "
                              "to Golden Records (no POST is made)")
+    parser.add_argument("--csv", metavar="PATH",
+                        help="Write the mapped records to a Golden Records CSV "
+                             "bulk-import file at PATH instead of submitting them "
+                             "(no POST is made). Best for large historical "
+                             "imports, which the per-record API path throttles.")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Log every HTTP request's method, URL, status and "
                              "response body (useful for debugging API errors)")
@@ -853,12 +1025,14 @@ def main(argv=None):
     except RuntimeError as exc:
         raise SystemExit(f"Error: {exc}")
 
+    name_map, classification_map = load_mappings(args.mappings)
     lookups = Lookups(
         members=load_members(args.members),
         age_groups=load_age_groups(args.age_groups),
-        name_map=load_mappings(args.mappings),
+        name_map=name_map,
         round_ids=load_rounds(args.rounds),
         class_ids=load_bowtypes(args.bowtypes),
+        classification_map=classification_map,
     )
 
     try:
@@ -868,18 +1042,31 @@ def main(argv=None):
         raise SystemExit(f"Error: {exc}")
     print(f"Fetched {len(scores)} scores from the ExpertArcher API")
 
-    records, skips = process(scores, lookups)
-    print_report(len(scores), records, skips)
+    mapped, skips = process(scores, lookups)
+    print_report(len(scores), mapped, skips)
 
-    # Submit the mapped records to the live Golden Records API, unless this is
-    # a --dry-run (fetch/map/report only, no POST).
-    if not records:
+    # --csv writes a Golden Records bulk-import file and submits nothing. This
+    # is the route for large historical imports, where the per-record API path
+    # would be throttled (Golden Records allows only 200 requests/hour).
+    if args.csv:
+        if not mapped:
+            print("\nNothing mapped -- no CSV written.")
+        else:
+            write_csv(args.csv, mapped)
+            print(f"\nWrote {len(mapped)} record(s) to {args.csv} for Golden "
+                  f"Records CSV import (nothing was submitted).")
+        return
+
+    # Otherwise submit the mapped records to the live Golden Records API, unless
+    # this is a --dry-run (fetch/map/report only, no POST).
+    if not mapped:
         pass  # nothing mapped, nothing to submit
     elif args.dry_run:
-        print(f"\nDry run: {len(records)} record(s) would be submitted to "
+        print(f"\nDry run: {len(mapped)} record(s) would be submitted to "
               f"Golden Records (nothing was sent).")
     else:
-        print(f"\nSubmitting {len(records)} record(s) to Golden Records...")
+        print(f"\nSubmitting {len(mapped)} record(s) to Golden Records...")
+        records = [api_record(m) for m in mapped]
         try:
             result = submit_records(config, records, limiter,
                                     verbose=args.verbose)
