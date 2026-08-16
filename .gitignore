@@ -5,6 +5,9 @@
 # Member data downloaded from the API (contains personal data)
 golden-records/members.json
 
+# Full detail of rejected submissions, written per run for review
+submission-errors.log
+
 # uv / virtual environment
 .venv/
 

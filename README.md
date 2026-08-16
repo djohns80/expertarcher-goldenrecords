@@ -51,9 +51,13 @@ The pipeline lives in `main()`:
 3. **Map each score** to a Golden Records record (`transform_score`), resolving
    round / bow-type / member / age-group names to ids (`resolve`).
 4. **Report** what mapped and what was skipped, and why (`print_report`).
+5. **Submit** the mapped records to Golden Records (`submit_records`), unless
+   `--dry-run` was given.
 
-The tool is **read-only**: it reports, and does not submit anything to Golden
-Records or write an output file.
+**Runs submit by default.** After reporting, the mapped records are POSTed to the
+Golden Records Scores API, so run the tool deliberately. Pass `--dry-run` to
+fetch, map and report without sending anything. See
+[Submitting scores](#submitting-scores).
 
 ## The two APIs
 
@@ -91,11 +95,11 @@ The keys below are exactly what the Golden Records Scores API expects.
 | `round_id` | `round` name → id | Via mappings + `rounds.json` (see [Name resolution](#name-resolution)) |
 | `class_id` | `bowtype` name → id | Via mappings + `bowtypes.json` |
 | `age_group_id` | `gender` + `class` → id | e.g. `female` + `u14` → "Women U14" → id (`get_age_group`) |
-| `date_shot` | `date` | ExpertArcher datetime reduced to `DD/MM/YYYY` |
+| `date_shot` | `date` | ExpertArcher datetime reduced to ISO `YYYY-MM-DD` |
 | `score`, `hits`, `golds` | same | Parsed as integers |
 | `Xs` | `xs` / `Xs` | Either casing accepted; missing = 0 |
 | `location` | `place` | Free text |
-| `status` | `tournament` / `competition` flags | `Open Competition` / `Club Competition` / `Club Event` |
+| `status` | `tournament` / `competition` flags | `ScoreStatusOptions` enum int: `4` Open Competition / `3` Club Competition / `2` Club Event |
 | `record_status` | `tournament` | `True` only for open tournaments |
 | `qualifying` | `round` name | `False` for "252" award rounds |
 | `record_qualifying` | — | Always `True` (eligible for club records) |
@@ -139,14 +143,20 @@ secrets** — all API keys live in `.env`, which is gitignored.
 ## Usage
 
 ```bash
-# Process scores shot in July 2026
+# Process AND submit scores shot in July 2026 (see the warning below)
 uv run python app.py --from 2026-07-01 --to 2026-08-01
+
+# Same, but fetch/map/report only -- nothing is submitted
+uv run python app.py --dry-run --from 2026-07-01 --to 2026-08-01
 
 # Re-download the Golden Records reference files first
 uv run python app.py --refresh --from 2026-07-01 --to 2026-08-01
 
 uv run python app.py --help    # all options
 ```
+
+> Runs submit to Golden Records by default; use `--dry-run` to skip it — see
+> [Submitting scores](#submitting-scores).
 
 ### The report
 
@@ -181,6 +191,53 @@ record count. Skip categories:
 - **Unmatched age group** — the gender/class combination didn't resolve.
 - **Invalid number / date** — a required field was missing or unparseable.
 
+## Submitting scores
+
+> ⚠️ **Runs write live data to Golden Records by default and this cannot be
+> undone from the tool.** Run it only when you mean to submit. To fetch, map and
+> report without sending anything, pass `--dry-run`.
+
+After printing the report, the tool POSTs each mapped record to the Golden
+Records Scores API (`POST {base_url}/scores`, one record per request):
+
+```bash
+uv run python app.py --from 2026-07-01 --to 2026-08-01
+
+# Dry run: everything except the POST
+uv run python app.py --dry-run --from 2026-07-01 --to 2026-08-01
+```
+
+With `--dry-run` the tool reports how many records *would* be submitted and
+sends nothing. Otherwise each mapped record is POSTed individually, spaced by the
+same rate limiter and retried on 429/5xx like the reference fetches. Submission
+continues past any records the API rejects, so one bad record does not block the
+rest. Skipped records (from the report) are never submitted.
+
+### Submission results
+
+After submitting, the tool prints a summary rather than one line per record:
+
+```
+Submitted 12 of 15 record(s).
+Duplicates skipped (already in Golden Records): 2
+
+SUBMISSION ERRORS BY TYPE
+============================================================
+    - No valid entry in Date Shot field.  (1)
+
+Full detail of the 3 rejected record(s) written to submission-errors.log
+```
+
+- **Duplicates** — the API rejects a score it already holds with *"This score
+  already exists in the database."* This is benign (expected when you re-run a
+  submission), so it is counted on its own line, separate from real errors.
+- **Errors by type** — every other rejection is counted by the API's own error
+  message, so systematic problems (e.g. a bad field) stand out at a glance.
+- **`submission-errors.log`** — the full detail of every rejected record (the
+  response body and the record that was sent) is appended here for separate
+  review, instead of flooding the report. The file is gitignored; change its
+  path with `--error-log`. `--verbose` still logs every request live.
+
 ## A more native integration
 
 This tool works from the outside in — pulling scores and reference data over
@@ -202,14 +259,15 @@ mapping table above is the same either way.
 ## Project layout
 
 ```
-app.py            The whole tool (fetch → map → report)
-config.toml       API config for both services (no secrets; committed)
-.env.example      Template for the API keys → copy to .env (gitignored)
-mappings.toml     ExpertArcher → Golden Records name overrides
-golden-records/   Cached reference data downloaded from Golden Records
+app.py                 The whole tool (fetch → map → report → submit)
+config.toml            API config for both services (no secrets; committed)
+.env.example           Template for the API keys → copy to .env (gitignored)
+mappings.toml          ExpertArcher → Golden Records name overrides
+golden-records/        Cached reference data downloaded from Golden Records
   rounds.json, bowtypes.json, age-groups.json   (committed)
   members.json                                  (gitignored — personal data)
-pyproject.toml    Dependencies / uv project
+submission-errors.log  Full detail of rejected submissions (gitignored; per run)
+pyproject.toml         Dependencies / uv project
 ```
 
 ## Notes on data & privacy

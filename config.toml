@@ -23,6 +23,9 @@ rounds = "/rounds"
 bowtypes = "/classes"
 age_groups = "/age-groups"
 members = "/members"
+# POST target for submitting mapped scores (written on every run except
+# `app.py --dry-run`).
+scores = "/scores"
 
 [api.pagination]
 # The reference endpoints return a page of records as a JSON list (the same

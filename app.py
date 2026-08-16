@@ -12,6 +12,11 @@ Pipeline (see main() at the bottom):
   3. Map each score to a Golden Records record (transform_score), resolving
      round / bow-type / member / age-group names to ids (resolve).
   4. Report what mapped and what was skipped, and why (print_report).
+  5. Submit the mapped records to Golden Records (submit_records), unless
+     --dry-run was given.
+  6. Report the submission outcome (report_submission): accepted / duplicate /
+     error counts, errors grouped by type, with full per-record detail written
+     to the error log (--error-log) for review.
 
 Scores come from the ExpertArcher API (the [expertarcher] section of
 config.toml); the reporting window is set with --from / --to. The Golden
@@ -20,7 +25,12 @@ members.json) are downloaded from the API when missing (or with --refresh),
 using the [api] section. API keys are read from the environment, never a file
 (see the ENV_* constants). See build_arg_parser for all options.
 
-This script reports only; it does not submit anything or write an output file.
+After reporting, the mapped records are POSTed to the Golden Records Scores API
+(POST /scores, one record per request); skipped records are never submitted.
+Rejections continue past (one bad record does not block the rest) and are split
+into duplicates (already submitted -- benign) and genuine errors. This writes
+live data, so runs submit by default -- pass --dry-run to fetch, map and report
+without POSTing anything.
 README.md has the full integration overview, field mapping and setup.
 """
 
@@ -43,9 +53,25 @@ DEFAULT_ROUNDS = os.path.join(GR_DIR, "rounds.json")
 DEFAULT_BOWTYPES = os.path.join(GR_DIR, "bowtypes.json")
 DEFAULT_MAPPINGS = "mappings.toml"
 DEFAULT_CONFIG = "config.toml"
+# Full detail of any rejected submissions is appended here for separate review;
+# the report itself only shows counts. Overridable with --error-log.
+DEFAULT_ERROR_LOG = "submission-errors.log"
 
 # Numeric score fields that must be present and integer-parseable.
 NUMERIC_FIELDS = ("score", "hits", "golds")
+
+# Golden Records ScoreStatusOptions enum. The `status` field is sent as one of
+# these integer codes (the string names are rejected).
+STATUS_PRACTICE = 1
+STATUS_CLUB_EVENT = 2
+STATUS_CLUB_COMPETITION = 3
+STATUS_OPEN_COMPETITION = 4
+
+# The Scores API returns this exact message (in the response body's `errors`
+# list) when a matching score is already present. It is not a real failure --
+# it just means the score was submitted before -- so it is counted and reported
+# separately from genuine errors (see submit_records / report_submission).
+DUPLICATE_ERROR = "This score already exists in the database."
 
 # API keys are read from the environment, never from a file, so they stay out
 # of source control. For Golden Records set the API key (preferred) or the
@@ -64,6 +90,16 @@ Lookups = namedtuple(
     "Lookups",
     "members age_groups name_map round_ids class_ids",
 )
+
+# One rejected submission: its position in the submitted list, the API's
+# `errors` messages (used to categorise it), the full error message (for the
+# log) and the record we sent (for context in the log).
+Failure = namedtuple("Failure", "index errors message record")
+
+# Outcome of a submission run: how many were accepted, which were duplicates
+# (benign) and which were genuine errors. duplicates/errors are lists of
+# Failure (see submit_records).
+SubmitResult = namedtuple("SubmitResult", "submitted duplicates errors")
 
 
 def load_json(path):
@@ -123,7 +159,7 @@ class RateLimiter:
     Golden Records throttles to 1 request/second (and 20/minute, 200/hour).
     Spacing requests at least `min_interval` apart satisfies the per-second
     limit; a single run makes only a handful of requests, so the minute/hour
-    limits are not a concern (the retry logic in `_get_with_retry` handles them
+    limits are not a concern (the retry logic in `_request_with_retry` handles them
     if they ever are). One shared instance spaces every request in a run --
     across both the Golden Records downloads and the ExpertArcher scores fetch.
     """
@@ -140,7 +176,7 @@ class RateLimiter:
         self._last = time.monotonic()
 
 
-def fetch_resource(config, endpoint_key, limiter):
+def fetch_resource(config, endpoint_key, limiter, verbose=False):
     """Download a full reference resource from the Golden Records API.
 
     Pages through the endpoint (authenticated with the configured API key or
@@ -183,10 +219,10 @@ def fetch_resource(config, endpoint_key, limiter):
     url = base_url + endpoint
     records = []
     while True:
-        response = _get_with_retry(
-            requests, url, auth_kwargs,
-            {page_param: page, size_param: page_size},
-            limiter, endpoint_key, max_retries, backoff,
+        response = _request_with_retry(
+            requests, "GET", url, auth_kwargs, limiter, endpoint_key,
+            max_retries, backoff,
+            params={page_param: page, size_param: page_size}, verbose=verbose,
         )
         batch = response.json()
         records.extend(batch)
@@ -196,7 +232,7 @@ def fetch_resource(config, endpoint_key, limiter):
     return records
 
 
-def fetch_scores(config, limiter, date_from=None, date_to=None):
+def fetch_scores(config, limiter, date_from=None, date_to=None, verbose=False):
     """Fetch the scores to process from the ExpertArcher API.
 
     The API key is sent as a query-string parameter (not a header, unlike
@@ -235,11 +271,70 @@ def fetch_scores(config, limiter, date_from=None, date_to=None):
 
     # Reuse the shared retry policy; the endpoint is not paged.
     th = config.get("api", {}).get("throttle", {})
-    response = _get_with_retry(
-        requests, base_url + endpoint, {}, params, limiter,
-        "scores", th.get("max_retries", 5), th.get("backoff_seconds", 2.0),
+    response = _request_with_retry(
+        requests, "GET", base_url + endpoint, {}, limiter, "scores",
+        th.get("max_retries", 5), th.get("backoff_seconds", 2.0), params=params,
+        verbose=verbose,
     )
     return response.json()
+
+
+def submit_records(config, records, limiter, verbose=False):
+    """POST each mapped record to the Golden Records Scores API.
+
+    One record per request (the API's contract), authenticated like the
+    reference fetches, spaced by the shared limiter and retried on 429/5xx.
+    Submission continues past individual rejections so one bad record does not
+    block the rest. Rejections are split into duplicates (the score was already
+    submitted -- benign) and genuine errors, so the report can treat them
+    differently (see report_submission). Returns a SubmitResult.
+
+    This WRITES LIVE DATA to Golden Records. It runs on every invocation except
+    --dry-run (see main), so the script should only be run deliberately.
+    """
+    try:
+        import requests
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "The 'requests' package is required to submit scores. "
+            "Install dependencies with `uv sync`."
+        ) from exc
+
+    api = config.get("api", {})
+    base_url = api.get("base_url", "").rstrip("/")
+    endpoint = api.get("endpoints", {}).get("scores", "")
+    auth_kwargs = _build_auth()
+    if not (base_url and endpoint and auth_kwargs):
+        raise RuntimeError(
+            f"Golden Records API is not configured for submission. Set base_url "
+            f"and endpoints.scores in {DEFAULT_CONFIG}, and credentials in the "
+            f"environment (${ENV_API_KEY}, or ${ENV_USERNAME}/${ENV_PASSWORD})."
+        )
+
+    th = api.get("throttle", {})
+    max_retries = th.get("max_retries", 5)
+    backoff = th.get("backoff_seconds", 2.0)
+
+    url = base_url + endpoint
+    submitted = 0
+    duplicates = []
+    errors = []
+    for index, record in enumerate(records):
+        try:
+            _request_with_retry(requests, "POST", url, auth_kwargs, limiter,
+                                "scores", max_retries, backoff, json=record,
+                                verbose=verbose)
+            submitted += 1
+        except ApiError as exc:
+            failure = Failure(index, exc.errors, str(exc), record)
+            if DUPLICATE_ERROR in exc.errors:
+                duplicates.append(failure)
+            else:
+                errors.append(failure)
+        except RuntimeError as exc:
+            # Transport-level failure with no response body to categorise.
+            errors.append(Failure(index, [], str(exc), record))
+    return SubmitResult(submitted, duplicates, errors)
 
 
 def _build_auth():
@@ -265,23 +360,72 @@ def _build_auth():
     return {}
 
 
-def _get_with_retry(requests, url, auth_kwargs, params, limiter, endpoint_key, max_retries, backoff):
-    """GET a page, waiting on the limiter and retrying 429/5xx with backoff.
+class ApiError(RuntimeError):
+    """An API request that failed with an HTTP error response.
 
-    `auth_kwargs` carries the credentials (from `_build_auth`) and is splatted
-    into the request. Retries honour a `Retry-After` header (seconds) when the
-    server sends one, otherwise use exponential backoff. Non-retryable errors
-    (e.g. 4xx other than 429) and exhausted retries are raised as a RuntimeError.
+    Subclasses RuntimeError so existing `except RuntimeError` handlers keep
+    working, but also carries the parsed detail (status code and the response
+    body's `errors` list) so callers can categorise failures -- e.g. tell a
+    duplicate submission apart from a validation error -- rather than only
+    string-matching the message.
+    """
+
+    def __init__(self, message, status_code=None, errors=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.errors = errors or []
+
+
+def _extract_errors(response):
+    """Pull the `errors` list out of a Golden Records error response body.
+
+    The API returns validation/failure detail as {"errors": ["...", ...]}.
+    Returns a list of message strings (empty if the body has none or is not
+    JSON), used to categorise submission failures.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return []
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if isinstance(errors, list):
+        return [str(item) for item in errors]
+    if isinstance(errors, str):
+        return [errors]
+    return []
+
+
+def _request_with_retry(requests, method, url, auth_kwargs, limiter, label,
+                        max_retries, backoff, params=None, json=None,
+                        verbose=False):
+    """Make one HTTP request, waiting on the limiter and retrying 429/5xx.
+
+    Shared by the GET fetches and the POST submissions. `auth_kwargs` carries
+    the credentials (from `_build_auth`) and is splatted into the request;
+    `params` sets the query string and `json` the request body. Retries honour
+    a `Retry-After` header (seconds) when the server sends one, otherwise use
+    exponential backoff. An HTTP error response (e.g. 4xx other than 429, or a
+    5xx that outlasts the retries) is raised as an ApiError carrying the status
+    code and the response body's `errors` list; its message also includes the
+    body, which is where Golden Records puts its detail and which
+    raise_for_status() would otherwise drop. A transport-level failure with no
+    response (e.g. connection error) is raised as a plain RuntimeError. With
+    `verbose`, every request's method/URL/status/body is logged.
     """
     for attempt in range(max_retries + 1):
         limiter.wait()
         try:
-            response = requests.get(url, params=params, timeout=30, **auth_kwargs)
+            response = requests.request(method, url, params=params, json=json,
+                                        timeout=30, **auth_kwargs)
         except requests.RequestException as exc:
             if attempt < max_retries:
                 time.sleep(backoff * (2 ** attempt))
                 continue
-            raise RuntimeError(f"Failed to download '{endpoint_key}' from {url}: {exc}") from exc
+            raise RuntimeError(f"{method} {url} ({label}) failed: {exc}") from exc
+
+        if verbose:
+            print(f"  [http] {method} {response.url} -> {response.status_code} "
+                  f"{_body_snippet(response)}")
 
         if response.status_code == 429 or response.status_code >= 500:
             if attempt < max_retries:
@@ -291,8 +435,34 @@ def _get_with_retry(requests, url, auth_kwargs, params, limiter, endpoint_key, m
         try:
             response.raise_for_status()
         except requests.RequestException as exc:
-            raise RuntimeError(f"Failed to download '{endpoint_key}' from {url}: {exc}") from exc
+            raise ApiError(
+                f"{method} {url} ({label}) failed: {exc} -- "
+                f"response body: {_body_snippet(response)}",
+                status_code=response.status_code,
+                errors=_extract_errors(response),
+            ) from exc
         return response
+
+
+def _body_snippet(response, limit=1000):
+    """Return a short, single-line snippet of a response body for logging.
+
+    Golden Records returns error detail (validation messages) in the body of a
+    4xx, which raise_for_status() drops. Prefer a compact JSON rendering, fall
+    back to raw text, collapse whitespace to keep it on one line, and truncate
+    so log/error lines stay readable.
+    """
+    try:
+        text = json.dumps(response.json(), ensure_ascii=False,
+                          separators=(",", ":"))
+    except ValueError:
+        text = response.text or ""
+    text = " ".join(text.split())
+    if not text:
+        return "(empty body)"
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    return text
 
 
 def _retry_delay(response, attempt, backoff):
@@ -326,7 +496,8 @@ def _is_last_page(response, page, batch, page_size):
     return len(batch) < page_size
 
 
-def ensure_reference_file(path, endpoint_key, config, refresh, limiter):
+def ensure_reference_file(path, endpoint_key, config, refresh, limiter,
+                          verbose=False):
     """Ensure `path` exists, downloading it from the API when missing/refreshing.
 
     Returns True if the file was (re)downloaded, False if the existing file
@@ -334,7 +505,7 @@ def ensure_reference_file(path, endpoint_key, config, refresh, limiter):
     """
     if os.path.exists(path) and not refresh:
         return False
-    records = fetch_resource(config, endpoint_key, limiter)
+    records = fetch_resource(config, endpoint_key, limiter, verbose=verbose)
     directory = os.path.dirname(path)
     if directory:
         os.makedirs(directory, exist_ok=True)
@@ -345,14 +516,15 @@ def ensure_reference_file(path, endpoint_key, config, refresh, limiter):
 
 
 def format_date(value):
-    """Format an ExpertArcher ISO datetime as a date-only DD/MM/YYYY string.
+    """Format an ExpertArcher datetime as an ISO date-only YYYY-MM-DD string.
 
-    ExpertArcher supplies a full datetime, but Golden Records and the report
-    only use the date. Returns the original value unchanged if it cannot be
-    parsed, so the report can still show something useful.
+    ExpertArcher supplies a full datetime, but the Golden Records `date_shot`
+    field is a plain date and expects the ISO form (YYYY-MM-DD); other formats
+    are rejected as "No valid entry in Date Shot field." Returns the original
+    value unchanged if it cannot be parsed, so the caller can detect that.
     """
     try:
-        return datetime.fromisoformat(value).strftime("%d/%m/%Y")
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d")
     except (TypeError, ValueError):
         return value
 
@@ -441,11 +613,11 @@ def transform_score(score, lookups):
     ea_tournament = bool(score.get("tournament", False))
     ea_competition = bool(score.get("competition", False))
     if ea_tournament:
-        status = "Open Competition"
+        status = STATUS_OPEN_COMPETITION
     elif ea_competition:
-        status = "Club Competition"
+        status = STATUS_CLUB_COMPETITION
     else:
-        status = "Club Event"
+        status = STATUS_CLUB_EVENT
 
     place = score.get("place")
     location = place.strip() if isinstance(place, str) else ""
@@ -457,7 +629,7 @@ def transform_score(score, lookups):
     record = {
         "age_group_id": lookups.age_groups[age_group_name],  # GR id: Men/Women + age band
         "class_id": class_id,                                # GR id: bow type
-        "date_shot": date_shot,                              # DD/MM/YYYY (date only)
+        "date_shot": date_shot,                              # ISO YYYY-MM-DD (date only)
         "member_id": lookups.members[ea_name],               # GR id: the archer
         "golds": numbers["golds"],
         "hits": numbers["hits"],
@@ -467,7 +639,7 @@ def transform_score(score, lookups):
         "record_status": ea_tournament,                      # True only for open tournaments
         "round_id": round_id,                                # GR id: round
         "score": numbers["score"],
-        "status": status,                                    # Open Competition / Club Competition / Club Event
+        "status": status,                                    # ScoreStatusOptions enum: 2=Club Event, 3=Club Competition, 4=Open Competition
         "Xs": xs,
     }
     return record, None
@@ -545,6 +717,59 @@ def _collapse(category, entries):
     return Counter(keys), labels
 
 
+def report_submission(result, total, error_log_path):
+    """Summarise a submission run, and write full failure detail to a log.
+
+    Prints the accepted / duplicate / error counts and, for genuine errors, a
+    breakdown by error type (the API's own messages). Duplicates are shown as a
+    single benign count -- re-running a submission is expected to report them.
+    The full per-record detail (the response bodies) is appended to
+    `error_log_path` for separate review rather than flooding the report.
+    """
+    print(f"Submitted {result.submitted} of {total} record(s).")
+    if result.duplicates:
+        print(f"Duplicates skipped (already in Golden Records): "
+              f"{len(result.duplicates)}")
+    if result.errors:
+        print(f"Rejected with errors: {len(result.errors)}")
+
+        # Count by error type -- the API's own messages. A record may carry
+        # more than one message; count each so the totals explain every error.
+        counts = Counter()
+        for failure in result.errors:
+            for message in (failure.errors or ["(no error detail -- see log)"]):
+                counts[message] += 1
+
+        print("\nSUBMISSION ERRORS BY TYPE")
+        print("=" * 60)
+        for message, count in counts.most_common():
+            print(f"    - {message}  ({count})")
+
+    failures = result.duplicates + result.errors
+    if failures:
+        write_error_log(error_log_path, failures)
+        print(f"\nFull detail of the {len(failures)} rejected record(s) "
+              f"written to {error_log_path}")
+
+
+def write_error_log(path, failures):
+    """Append full detail of rejected submissions to a log file for review.
+
+    Each run adds a timestamped block: one entry per rejected record with the
+    full error message (status + response body) and the record we sent, so a
+    reviewer can see exactly what was rejected and why. Appends (does not
+    overwrite) so a history builds up across runs.
+    """
+    stamp = datetime.now().isoformat(timespec="seconds")
+    with open(path, "a", encoding="utf-8") as file:
+        file.write(f"# {stamp} -- {len(failures)} rejected submission(s)\n")
+        for failure in failures:
+            file.write(f"record {failure.index}: {failure.message}\n")
+            file.write("    submitted: "
+                       f"{json.dumps(failure.record, ensure_ascii=False)}\n")
+        file.write("\n")
+
+
 def _fmt(detail):
     """Render an offending value for the report, flagging missing/empty ones."""
     return repr(detail) if detail not in (None, "") else "(missing / empty)"
@@ -577,6 +802,15 @@ def build_arg_parser():
     parser.add_argument("--refresh", action="store_true",
                         help="Re-download the reference files from the API even "
                              "if they already exist locally")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Fetch, map and report, but do NOT submit anything "
+                             "to Golden Records (no POST is made)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Log every HTTP request's method, URL, status and "
+                             "response body (useful for debugging API errors)")
+    parser.add_argument("--error-log", default=DEFAULT_ERROR_LOG,
+                        help=f"File to append full detail of any rejected "
+                             f"submissions to (default: {DEFAULT_ERROR_LOG})")
     return parser
 
 
@@ -608,7 +842,8 @@ def main(argv=None):
                                    (args.bowtypes, "bowtypes"),
                                    (args.age_groups, "age_groups"),
                                    (args.members, "members")]:
-            if ensure_reference_file(path, endpoint_key, config, args.refresh, limiter):
+            if ensure_reference_file(path, endpoint_key, config, args.refresh,
+                                     limiter, verbose=args.verbose):
                 print(f"Downloaded {path} from the Golden Records API")
     except RuntimeError as exc:
         raise SystemExit(f"Error: {exc}")
@@ -622,13 +857,30 @@ def main(argv=None):
     )
 
     try:
-        scores = fetch_scores(config, limiter, args.date_from, args.date_to)
+        scores = fetch_scores(config, limiter, args.date_from, args.date_to,
+                              verbose=args.verbose)
     except RuntimeError as exc:
         raise SystemExit(f"Error: {exc}")
     print(f"Fetched {len(scores)} scores from the ExpertArcher API")
 
     records, skips = process(scores, lookups)
     print_report(len(scores), records, skips)
+
+    # Submit the mapped records to the live Golden Records API, unless this is
+    # a --dry-run (fetch/map/report only, no POST).
+    if not records:
+        pass  # nothing mapped, nothing to submit
+    elif args.dry_run:
+        print(f"\nDry run: {len(records)} record(s) would be submitted to "
+              f"Golden Records (nothing was sent).")
+    else:
+        print(f"\nSubmitting {len(records)} record(s) to Golden Records...")
+        try:
+            result = submit_records(config, records, limiter,
+                                    verbose=args.verbose)
+        except RuntimeError as exc:
+            raise SystemExit(f"Error: {exc}")
+        report_submission(result, len(records), args.error_log)
 
 
 if __name__ == "__main__":
