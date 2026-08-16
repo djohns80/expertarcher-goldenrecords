@@ -29,8 +29,9 @@ scores = "/scores"
 
 [api.pagination]
 # The reference endpoints return a page of records as a JSON list (the same
-# shape saved to the local files). These settings drive the paging loop: pages
-# are requested until one comes back with fewer than page_size records.
+# shape saved to the local files). These settings drive the paging loop: the
+# last page is detected from the `paging-headers` response header when present,
+# otherwise from a page coming back with fewer than page_size records.
 page_param = "pageNumber" # query-string parameter carrying the page number
 size_param = "pageSize"   # query-string parameter carrying the page size
 page_size = 500           # records requested per page

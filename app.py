@@ -60,6 +60,10 @@ DEFAULT_ERROR_LOG = "submission-errors.log"
 # Numeric score fields that must be present and integer-parseable.
 NUMERIC_FIELDS = ("score", "hits", "golds")
 
+# Constant tag written to every submitted record's `user_1` field, identifying
+# the ExpertArcher integration as the source of the score.
+USER_1_TAG = "Expert Archer"
+
 # Golden Records ScoreStatusOptions enum. The `status` field is sent as one of
 # these integer codes (the string names are rejected).
 STATUS_PRACTICE = 1
@@ -640,6 +644,7 @@ def transform_score(score, lookups):
         "round_id": round_id,                                # GR id: round
         "score": numbers["score"],
         "status": status,                                    # ScoreStatusOptions enum: 2=Club Event, 3=Club Competition, 4=Open Competition
+        "user_1": USER_1_TAG,                                # constant tag marking the ExpertArcher integration as source
         "Xs": xs,
     }
     return record, None

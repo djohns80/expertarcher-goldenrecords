@@ -1,30 +1,19 @@
 # ExpertArcher → Golden Records
 
-A small Python tool that reads a club's scores from the **ExpertArcher** API and
-maps each one onto the record shape the **Golden Records** Scores API expects.
-Scores that can't be mapped are skipped and explained in a readable report, so
-the underlying data can be fixed at source.
+A small Python tool that reads a club's scores from the **ExpertArcher** API,
+maps each one onto the record shape the **Golden Records** Scores API expects,
+and — by default — submits the mapped scores to Golden Records (use `--dry-run`
+to fetch, map and report only). Scores that can't be mapped are skipped and
+explained in a readable report, so the underlying data can be fixed at source.
 
 It is intentionally a single, readable script ([app.py](app.py)) rather than a
 framework — the goal is to make the integration easy to follow.
-
-## Who this is for
-
-- **ExpertArcher developers** — to see exactly what data Golden Records needs and
-  how ExpertArcher scores translate into it. If ExpertArcher ever wants to push
-  scores to Golden Records natively, [app.py](app.py) is a working reference for
-  the field mapping, name resolution and the API calls involved. See
-  [A more native integration](#a-more-native-integration).
-- **Golden Records developers** — to see how a third party integrates with your
-  APIs: how we authenticate, page, respect throttling, and what the outgoing
-  score record looks like. The record built in `transform_score` is the
-  integration contract.
 
 ## How it works
 
 ```
 ExpertArcher API                     Golden Records API
-   (scores)                          (reference data: ids)
+   (scores)                          (reference ids + score target)
       │                                     │
       │  GET /club?apikey=…&from=…&to=…     │  GET /rounds, /classes,
       │                                     │      /age-groups, /members
@@ -39,6 +28,10 @@ ExpertArcher API                     Golden Records API
         ▼                         ▼
   Golden Records            skipped records
   score records             (grouped report)
+        │
+        │  POST /scores  (one record per request, unless --dry-run)
+        ▼
+  Golden Records API
 ```
 
 The pipeline lives in `main()`:
@@ -53,6 +46,9 @@ The pipeline lives in `main()`:
 4. **Report** what mapped and what was skipped, and why (`print_report`).
 5. **Submit** the mapped records to Golden Records (`submit_records`), unless
    `--dry-run` was given.
+6. **Report the submission outcome** (`report_submission`): accepted /
+   duplicate / error counts, errors grouped by type, with full per-record
+   detail written to the error log. See [Submission results](#submission-results).
 
 **Runs submit by default.** After reporting, the mapped records are POSTed to the
 Golden Records Scores API, so run the tool deliberately. Pass `--dry-run` to
@@ -61,12 +57,13 @@ fetch, map and report without sending anything. See
 
 ## The two APIs
 
-| | ExpertArcher (source) | Golden Records (reference) |
+| | ExpertArcher (source) | Golden Records (reference + target) |
 |---|---|---|
-| Used for | The scores to process | Ids for rounds, bow classes, age groups, members |
-| Endpoint | `GET {base_url}/club` | `GET {base_url}/rounds`, `/classes`, `/age-groups`, `/members` |
+| Used for | The scores to process | Ids for rounds, bow classes, age groups, members — **and** receiving the mapped scores |
+| Read | `GET {base_url}/club` | `GET {base_url}/rounds`, `/classes`, `/age-groups`, `/members` |
+| Write | — | `POST {base_url}/scores` (one mapped record per request; see [Submitting scores](#submitting-scores)) |
 | Auth | API key as a **query-string** param (`apikey=…`) | API key as `Authorization: Basic <key>` header, **or** HTTP Basic Auth |
-| Paging | Single request (date range bounds the result) | Paged; last page detected via the `paging-headers` response header |
+| Paging | Single request (date range bounds the result) | Reads are paged; last page detected via the `paging-headers` response header, falling back to a short final page when that header is absent |
 | Config | `[expertarcher]` in [config.toml](config.toml) | `[api]` in [config.toml](config.toml) |
 
 ### Authentication notes for Golden Records
@@ -82,7 +79,8 @@ Golden Records supports two schemes (`_build_auth`), API key first:
 
 Both APIs are rate-limited by a single shared `RateLimiter` (Golden Records
 throttles to 1/second, 20/minute, 200/hour) and retried with exponential
-backoff, honouring any `Retry-After` header (`_get_with_retry`).
+backoff, honouring any `Retry-After` header (`_request_with_retry`, shared by
+the GET fetches and the POST submissions).
 
 ## Field mapping
 
@@ -98,11 +96,12 @@ The keys below are exactly what the Golden Records Scores API expects.
 | `date_shot` | `date` | ExpertArcher datetime reduced to ISO `YYYY-MM-DD` |
 | `score`, `hits`, `golds` | same | Parsed as integers |
 | `Xs` | `xs` / `Xs` | Either casing accepted; missing = 0 |
-| `location` | `place` | Free text |
+| `location` | `place` | Free text; trimmed, and empty when `place` is absent |
 | `status` | `tournament` / `competition` flags | `ScoreStatusOptions` enum int: `4` Open Competition / `3` Club Competition / `2` Club Event |
 | `record_status` | `tournament` | `True` only for open tournaments |
 | `qualifying` | `round` name | `False` for "252" award rounds |
 | `record_qualifying` | — | Always `True` (eligible for club records) |
+| `user_1` | — | Constant `Expert Archer` on every record, tagging the ExpertArcher integration as the source |
 
 ### Name resolution
 
@@ -157,6 +156,11 @@ uv run python app.py --help    # all options
 
 > Runs submit to Golden Records by default; use `--dry-run` to skip it — see
 > [Submitting scores](#submitting-scores).
+
+Beyond these, the reference-file locations (`--members`, `--age-groups`,
+`--rounds`, `--bowtypes`), the `--mappings` and `--config` paths, the
+`--error-log` path and `-v` / `--verbose` are all overridable — run
+`app.py --help` for the full list.
 
 ### The report
 
@@ -220,6 +224,7 @@ After submitting, the tool prints a summary rather than one line per record:
 ```
 Submitted 12 of 15 record(s).
 Duplicates skipped (already in Golden Records): 2
+Rejected with errors: 1
 
 SUBMISSION ERRORS BY TYPE
 ============================================================
@@ -228,33 +233,16 @@ SUBMISSION ERRORS BY TYPE
 Full detail of the 3 rejected record(s) written to submission-errors.log
 ```
 
-- **Duplicates** — the API rejects a score it already holds with *"This score
-  already exists in the database."* This is benign (expected when you re-run a
-  submission), so it is counted on its own line, separate from real errors.
+- **Duplicates** — the API rejects a score it already holds with the message
+  `This score already exists in the database.` This is benign (expected when you
+  re-run a submission), so it is counted on its own line, separate from real
+  errors.
 - **Errors by type** — every other rejection is counted by the API's own error
   message, so systematic problems (e.g. a bad field) stand out at a glance.
 - **`submission-errors.log`** — the full detail of every rejected record (the
   response body and the record that was sent) is appended here for separate
   review, instead of flooding the report. The file is gitignored; change its
   path with `--error-log`. `--verbose` still logs every request live.
-
-## A more native integration
-
-This tool works from the outside in — pulling scores and reference data over
-HTTP and mapping between them. If ExpertArcher wanted to integrate with Golden
-Records directly, [app.py](app.py) still documents what that requires:
-
-- The **target record shape** and field semantics (`transform_score`) — the data
-  Golden Records needs for each score.
-- The **name → id resolution** that any integration must perform, and the fact
-  that only a handful of round/bow-type names differ between the systems
-  (`resolve`, [mappings.toml](mappings.toml)).
-- The **derived fields** that aren't a straight copy (`status`, `qualifying`,
-  `record_status`, age-group derivation).
-
-A native integration could skip the ExpertArcher fetch and mapping entirely by
-emitting Golden Records records at the point scores are recorded — but the
-mapping table above is the same either way.
 
 ## Project layout
 
