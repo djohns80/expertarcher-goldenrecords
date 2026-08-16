@@ -2,36 +2,29 @@
 
 A small Python tool that reads a club's scores from the **ExpertArcher** API,
 maps each one onto the record shape the **Golden Records** Scores API expects,
-and — by default — submits the mapped scores to Golden Records (use `--dry-run`
-to fetch, map and report only). Scores that can't be mapped are skipped and
-explained in a readable report, so the underlying data can be fixed at source.
+and — by default — submits the mapped scores to Golden Records. It can instead
+write them to a **CSV bulk-import file** (`--csv`, best for large historical
+imports), or just fetch, map and report (`--dry-run`). Scores that can't be
+mapped are skipped and explained in a readable report, so the underlying data
+can be fixed at source.
 
 It is intentionally a single, readable script ([app.py](app.py)) rather than a
 framework — the goal is to make the integration easy to follow.
 
 ## How it works
 
-```
-ExpertArcher API                     Golden Records API
-   (scores)                          (reference ids + score target)
-      │                                     │
-      │  GET /club?apikey=…&from=…&to=…     │  GET /rounds, /classes,
-      │                                     │      /age-groups, /members
-      ▼                                     ▼
-   [ scores ]                        golden-records/*.json  (cached locally)
-      │                                     │
-      └──────────────┬──────────────────────┘
-                     ▼
-            transform_score()   ── map names → ids, derive fields
-                     │
-        ┌────────────┴────────────┐
-        ▼                         ▼
-  Golden Records            skipped records
-  score records             (grouped report)
-        │
-        │  POST /scores  (one record per request, unless --dry-run)
-        ▼
-  Golden Records API
+```mermaid
+flowchart TD
+    EA["ExpertArcher API<br/>(scores)"]
+    GR["Golden Records API<br/>(reference ids + score target)"]
+    EA -->|"GET /club?apikey=…&from=…&to=…"| S["scores"]
+    GR -->|"GET /rounds, /classes,<br/>/age-groups, /members"| REF["golden-records/*.json<br/>(cached locally)"]
+    S --> T["transform_score()<br/>map names → ids, derive fields"]
+    REF --> T
+    T --> M["mapped records"]
+    T --> SK["skipped records<br/>(grouped report)"]
+    M -->|"POST /scores — submit (default), one per request"| GROUT["Golden Records API"]
+    M -->|"write CSV (--csv) — bulk import, nothing submitted"| CSV["scores-import.csv"]
 ```
 
 The pipeline lives in `main()`:
@@ -40,7 +33,8 @@ The pipeline lives in `main()`:
    [golden-records/](golden-records/) directory, unless the files are already
    present. These provide the ids we map names onto. Re-download with `--refresh`.
 2. **Fetch the scores from ExpertArcher** (`fetch_scores`) for the `--from` /
-   `--to` window.
+   `--to` window, optionally filtered by archer name (`--include-name` /
+   `--exclude-name`).
 3. **Map each score** to a Golden Records record (`transform_score`), resolving
    round / bow-type / member / age-group names to ids (`resolve`).
 4. **Report** what mapped and what was skipped, and why (`print_report`).
@@ -53,8 +47,9 @@ The pipeline lives in `main()`:
 
 **Runs submit by default.** After reporting, the mapped records are POSTed to the
 Golden Records Scores API, so run the tool deliberately. Pass `--dry-run` to
-fetch, map and report without sending anything. See
-[Submitting scores](#submitting-scores).
+fetch, map and report without sending anything, or `--csv PATH` to write a
+bulk-import file instead of submitting. See [Submitting scores](#submitting-scores)
+and [Bulk import via CSV](#bulk-import-via-csv).
 
 ## The two APIs
 
